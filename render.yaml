@@ -7,31 +7,20 @@ services:
     env: docker
     autoDeploy: true
     plan: starter
-    # No startCommand for Docker runtime; Dockerfile CMD runs the app.
     envVars:
-      - fromGroup: common-secrets
-      
-      # --- Alpaca ---
-      - key: ALPACA_KEY_ID
-        fromSecret: alpaca-key-id
-      - key: ALPACA_SECRET_KEY
-        fromSecret: alpaca-secret-key
-      - key: ALPACA_PAPER
-        value: "true"
-      - key: ALPACA_DATA_FEED
-        value: sip
+      - fromGroup: common-secrets  # ALPACA_* and AWS_* live here
 
-      # --- S3 (read-only) ---
+      # --- S3 read-only + universe file ---
       - key: S3_BUCKET
         value: bkm-alpaca-models-01
       - key: S3_REGION
         value: us-east-2
       - key: S3_BASE_PREFIX
         value: models
-      - key: AWS_ACCESS_KEY_ID
-        fromSecret: aws-access-key-id
-      - key: AWS_SECRET_ACCESS_KEY
-        fromSecret: aws-secret-access-key
+      - key: UNIVERSE_S3_KEY
+        value: models/universe/daily.csv
+      - key: UNIVERSE_RELOAD_WINDOW_ET
+        value: 08:00-09:25
 
       # --- Pre-market-only model reload ---
       - key: MODEL_RELOAD_WINDOW_ET
@@ -42,8 +31,6 @@ services:
       # --- Runner config (only trading_bot) ---
       - key: ACTIVE_STRATEGIES
         value: trading_bot
-      - key: SCANNER_SYMBOLS
-        value: SPY,AAPL,MSFT,QQQ
       - key: TF_MIN_LIST
         value: 1,2,3,5,10
       - key: RANKED_STRATS
@@ -65,7 +52,7 @@ services:
       - key: POLL_SECONDS
         value: "10"
 
-      # --- Strategy-internal knobs (keep from your paper setup) ---
+      # --- Strategy-internal knobs (keep) ---
       - key: ALLOWED_EXCHANGES
         value: NYSE,NASDAQ,NASD,XNYS,XNAS
       - key: ALLOW_AFTERHOURS
@@ -112,39 +99,26 @@ services:
     autoDeploy: true
     plan: starter
     envVars:
-      # --- Alpaca ---
-      - key: ALPACA_KEY_ID
-        fromSecret: alpaca-key-id
-      - key: ALPACA_SECRET_KEY
-        fromSecret: alpaca-secret-key
-      - key: ALPACA_PAPER
-        value: "true"
-      - key: ALPACA_DATA_FEED
-        value: sip
+      - fromGroup: common-secrets
 
-      # --- S3 (read-only) ---
       - key: S3_BUCKET
         value: bkm-alpaca-models-01
       - key: S3_REGION
         value: us-east-2
       - key: S3_BASE_PREFIX
         value: models
-      - key: AWS_ACCESS_KEY_ID
-        fromSecret: aws-access-key-id
-      - key: AWS_SECRET_ACCESS_KEY
-        fromSecret: aws-secret-access-key
+      - key: UNIVERSE_S3_KEY
+        value: models/universe/daily.csv
+      - key: UNIVERSE_RELOAD_WINDOW_ET
+        value: 08:00-09:25
 
-      # --- Pre-market-only model reload ---
       - key: MODEL_RELOAD_WINDOW_ET
         value: 08:00-09:25
       - key: MODEL_REFRESH_SEC
         value: "60"
 
-      # --- Runner config (only ml_merged) ---
       - key: ACTIVE_STRATEGIES
         value: ml_merged
-      - key: SCANNER_SYMBOLS
-        value: SPY,AAPL,MSFT,QQQ
       - key: TF_MIN_LIST
         value: 1,2,3,5,10
       - key: RANKED_STRATS
@@ -215,39 +189,26 @@ services:
     autoDeploy: true
     plan: starter
     envVars:
-      # --- Alpaca ---
-      - key: ALPACA_KEY_ID
-        fromSecret: alpaca-key-id
-      - key: ALPACA_SECRET_KEY
-        fromSecret: alpaca-secret-key
-      - key: ALPACA_PAPER
-        value: "true"
-      - key: ALPACA_DATA_FEED
-        value: sip
+      - fromGroup: common-secrets
 
-      # --- S3 (read-only) ---
       - key: S3_BUCKET
         value: bkm-alpaca-models-01
       - key: S3_REGION
         value: us-east-2
       - key: S3_BASE_PREFIX
         value: models
-      - key: AWS_ACCESS_KEY_ID
-        fromSecret: aws-access-key-id
-      - key: AWS_SECRET_ACCESS_KEY
-        fromSecret: aws-secret-access-key
+      - key: UNIVERSE_S3_KEY
+        value: models/universe/daily.csv
+      - key: UNIVERSE_RELOAD_WINDOW_ET
+        value: 08:00-09:25
 
-      # --- Pre-market-only model reload ---
       - key: MODEL_RELOAD_WINDOW_ET
         value: 08:00-09:25
       - key: MODEL_REFRESH_SEC
         value: "60"
 
-      # --- Runner config (only ranked_ml, ranked) ---
       - key: ACTIVE_STRATEGIES
         value: ranked_ml
-      - key: SCANNER_SYMBOLS
-        value: SPY,AAPL,MSFT,QQQ
       - key: TF_MIN_LIST
         value: 1,2,3,5,10
       - key: RANKED_STRATS
@@ -314,29 +275,16 @@ services:
     autoDeploy: true
     plan: starter
     envVars:
-      # --- Alpaca (if trainer fetches data) ---
-      - key: ALPACA_KEY_ID
-        fromSecret: alpaca-key-id
-      - key: ALPACA_SECRET_KEY
-        fromSecret: alpaca-secret-key
-      - key: ALPACA_PAPER
-        value: "true"
-      - key: ALPACA_DATA_FEED
-        value: sip
+      - fromGroup: common-secrets
 
-      # --- S3 (read/write) ---
       - key: S3_BUCKET
         value: bkm-alpaca-models-01
       - key: S3_REGION
         value: us-east-2
       - key: S3_BASE_PREFIX
         value: models
-      - key: AWS_ACCESS_KEY_ID
-        fromSecret: aws-access-key-id
-      - key: AWS_SECRET_ACCESS_KEY
-        fromSecret: aws-secret-access-key
 
-      # --- Training window (ET) ---
+      # Training window (ET)
       - key: TRAIN_RUN_START_ET
         value: 19:00
       - key: TRAIN_RUN_END_ET
@@ -344,7 +292,7 @@ services:
       - key: TRAINER_SLEEP_SEC
         value: "60"
 
-      # --- What to train ---
+      # What to train
       - key: TRAIN_STRATEGIES
         value: ranked_ml,ml_merged
       - key: TRAIN_SYMBOLS
