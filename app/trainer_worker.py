@@ -38,21 +38,13 @@ RUN_START_ET = os.getenv("TRAIN_RUN_START_ET", "19:00")
 RUN_END_ET   = os.getenv("TRAIN_RUN_END_ET",   "20:00")
 TRAINER_SLEEP_SEC = int(os.getenv("TRAINER_SLEEP_SEC", "60"))
 
-# Full-universe training control
+# Use the S3 universe for training
 TRAIN_USE_UNIVERSE = os.getenv("TRAIN_USE_UNIVERSE", "1").lower() in ("1","true","yes")
 TRAIN_MAX_SYMBOLS  = int(os.getenv("TRAIN_MAX_SYMBOLS", "0"))  # 0 = no cap
 
-# Nightly universe builder config
+# Universe output
 UNIVERSE_WRITE_KEY = os.getenv("UNIVERSE_S3_WRITE_KEY", "models/universe/daily.csv")
-UNIVERSE_BATCH     = int(os.getenv("UNIVERSE_BATCH", "200"))  # smaller, safer batching
 UNIVERSE_MAX       = int(os.getenv("UNIVERSE_MAX", "8000"))
-
-U_MIN_PRICE     = float(os.getenv("UNIVERSE_MIN_LAST_PRICE", "1"))
-U_MIN_AVG_VOL   = int(os.getenv("UNIVERSE_MIN_AVG_VOL", "0"))
-U_MIN_TODAY_VOL = int(os.getenv("UNIVERSE_MIN_TODAY_VOL", "0"))
-
-# NEW: mode = "assets" (default for reliability) or "snapshots" (apply filters by price/volume)
-UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "assets").strip().lower()
 
 # =========================
 # UTIL
@@ -69,7 +61,7 @@ def _auth_headers() -> Dict[str, str]:
     return {"Apca-Api-Key-Id": ALPACA_KEY, "Apca-Api-Secret-Key": ALPACA_SECRET, "accept": "application/json"}
 
 # =========================
-# UNIVERSE SOURCES (Alpaca-only)
+# UNIVERSE (assets-only)
 # =========================
 
 def _list_us_equities() -> List[str]:
@@ -78,29 +70,8 @@ def _list_us_equities() -> List[str]:
     r = requests.get(url, headers=_auth_headers(), params=params, timeout=60)
     r.raise_for_status()
     assets = r.json()
-    syms = [a["symbol"].upper().strip() for a in assets if a.get("tradable")]
+    syms = [str(a.get("symbol","")).upper().strip() for a in assets if a.get("tradable")]
     return syms[:UNIVERSE_MAX]
-
-def _snapshots_batch(symbols: List[str]) -> dict:
-    """Return mapping symbol -> snapshot, tolerant to API shape."""
-    if not symbols:
-        return {}
-    url = f"{ALPACA_DATA_BASE}/v2/stocks/snapshots"
-    params = {"symbols": ",".join(symbols), "feed": "sip"}
-    r = requests.get(url, headers=_auth_headers(), params=params, timeout=90)
-    r.raise_for_status()
-    data = r.json() or {}
-    snaps = data.get("snapshots", {})
-    if isinstance(snaps, dict):
-        return snaps
-    # Some variants return a list of { "symbol": "AAPL", ... }
-    out = {}
-    if isinstance(snaps, list):
-        for item in snaps:
-            sym = str(item.get("symbol","")).upper().strip()
-            if sym:
-                out[sym] = item
-    return out
 
 def rebuild_universe_to_s3(registry: S3ModelRegistry):
     """Assets-only mode: write all active, tradable US equities to S3."""
@@ -108,65 +79,13 @@ def rebuild_universe_to_s3(registry: S3ModelRegistry):
         print("[UNIVERSE] S3 not configured; skipping", flush=True)
         return
     try:
-        # List active tradable US equities (capped by UNIVERSE_MAX)
-        url = f"{ALPACA_TRADING_BASE}/v2/assets"
-        params = {"asset_class": "us_equity", "status": "active"}
-        r = requests.get(url, headers=_auth_headers(), params=params, timeout=60)
-        r.raise_for_status()
-        assets = r.json()
-        syms = [str(a.get("symbol","")).upper().strip() for a in assets if a.get("tradable")]
-        keep = syms[:UNIVERSE_MAX]
+        keep = _list_us_equities()
         print(f"[UNIVERSE] assets-only -> keep {len(keep)} symbols", flush=True)
         csv_bytes = ("\n".join(sorted(set(keep))) + "\n").encode("utf-8")
         registry.s3.put_object(Bucket=S3_BUCKET, Key=UNIVERSE_WRITE_KEY, Body=csv_bytes)
         print(f"[UNIVERSE] wrote {len(set(keep))} symbols to s3://{S3_BUCKET}/{UNIVERSE_WRITE_KEY}", flush=True)
     except Exception as e:
         print(f"[UNIVERSE] assets-only error: {e}", flush=True)
-
-    keep: List[str] = []
-
-    if UNIVERSE_MODE == "assets":
-        # Keep everything (cap by UNIVERSE_MAX already applied)
-        keep = symbols.copy()
-        print(f"[UNIVERSE] mode=assets -> keep all {len(keep)} symbols", flush=True)
-    else:
-        # (B) snapshots filtering by price/volume
-        for i in range(0, len(symbols), UNIVERSE_BATCH):
-            batch = symbols[i:i+UNIVERSE_BATCH]
-            try:
-                snaps = _snapshots_batch(batch)
-            except Exception as e:
-                print(f"[UNIVERSE] snapshots error on batch {i//UNIVERSE_BATCH+1}: {e}", flush=True)
-                time.sleep(0.5)
-                continue
-
-            for sym in batch:
-                s = snaps.get(sym)
-                if not s:
-                    continue
-                prev = (s.get("prevDailyBar") or {})
-                last_close = float(prev.get("c") or 0.0)
-                prev_vol   = int(prev.get("v") or 0)
-                daily = (s.get("dailyBar") or {})
-                today_vol = int(daily.get("v") or 0)
-
-                if last_close >= U_MIN_PRICE and prev_vol >= U_MIN_AVG_VOL and today_vol >= U_MIN_TODAY_VOL:
-                    keep.append(sym)
-
-            print(f"[UNIVERSE] batch {i//UNIVERSE_BATCH+1}: kept_so_far={len(keep)}", flush=True)
-            time.sleep(0.15)
-
-        if not keep:
-            print("[UNIVERSE] snapshots filter produced 0 symbols; falling back to assets list", flush=True)
-            keep = symbols.copy()
-
-    # Write to S3
-    try:
-        csv_bytes = ("\n".join(sorted(set(keep))) + "\n").encode("utf-8")
-        registry.s3.put_object(Bucket=S3_BUCKET, Key=UNIVERSE_WRITE_KEY, Body=csv_bytes)
-        print(f"[UNIVERSE] wrote {len(set(keep))} symbols to s3://{S3_BUCKET}/{UNIVERSE_WRITE_KEY}", flush=True)
-    except ClientError as e:
-        print(f"[UNIVERSE] S3 write error: {e}", flush=True)
 
 def load_universe_from_s3(registry: S3ModelRegistry) -> List[str]:
     if not (S3_BUCKET and S3_REGION and UNIVERSE_WRITE_KEY):
@@ -205,9 +124,9 @@ def _aggregate_bars(symbol: str, tf_min: int, lookback_min: int = 7*24*60) -> pd
     }).dropna()
     return agg
 
-def _toy_fit(symbols: List[str], tfs: List[int]) -> tuple[bytes, dict]:
+def _toy_fit(sym_list: List[str], tfs: List[int]) -> tuple[bytes, dict]:
     metrics: List[float] = []
-    for sym in symbols:
+    for sym in sym_list:
         for tf in tfs:
             d = _aggregate_bars(sym, tf)
             if d is None or d.empty:
@@ -218,17 +137,17 @@ def _toy_fit(symbols: List[str], tfs: List[int]) -> tuple[bytes, dict]:
                 metrics.append(score)
 
     metric = float(pd.Series(metrics).mean()) if metrics else 0.0
-    model_json = {"kind": "toy_momentum", "trained_on": {"symbols_count": len(symbols), "tfs": tfs}, "params": {}}
+    model_json = {"kind": "toy_momentum", "trained_on": {"symbols_count": len(sym_list), "tfs": tfs}, "params": {}}
     artifact = json.dumps(model_json).encode("utf-8")
     meta = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "metric": metric, "metric_name": TRAIN_METRIC}
     return artifact, meta
 
-def train_once(strategy: str, symbols: List[str]):
+def train_once(strategy: str, sym_list: List[str]):
     try:
-        art, meta = _toy_fit(symbols, TRAIN_TFS)
+        art, meta = _toy_fit(sym_list, TRAIN_TFS)
         cand_id = _registry.save_candidate(strategy, art, meta)
         promoted = _registry.compare_and_maybe_promote(strategy, cand_id, higher_is_better=True)
-        print(f"[TRAIN] {strategy} metric={meta['metric']:.6f} on {len(symbols)} syms promoted={promoted} cand_id={cand_id}", flush=True)
+        print(f"[TRAIN] {strategy} metric={meta['metric']:.6f} on {len(sym_list)} syms promoted={promoted} cand_id={cand_id}", flush=True)
     except Exception as e:
         print(f"[TRAIN-ERROR] {strategy}: {e}", flush=True)
 
@@ -238,7 +157,7 @@ def main():
     if not (S3_BUCKET and S3_REGION):
         print("[BOOT] Missing S3 config; set S3_BUCKET / S3_REGION", flush=True)
 
-    print(f"[TRAINER] start strategies={TRAIN_STRATEGIES} tfs={TRAIN_TFS} use_universe={int(TRAIN_USE_UNIVERSE)} mode={UNIVERSE_MODE}", flush=True)
+    print(f"[TRAINER] start strategies={TRAIN_STRATEGIES} tfs={TRAIN_TFS} use_universe={int(TRAIN_USE_UNIVERSE)}", flush=True)
 
     ran_today = False
     while True:
@@ -253,22 +172,22 @@ def main():
                 if force:
                     print("[TRAINER] FORCE_RUN=1 -> running once now", flush=True)
 
-                # (1) Build tonight's universe
+                # (1) Build tonight's universe (assets-only)
                 rebuild_universe_to_s3(_registry)
 
                 # (2) Load symbols for training
                 if TRAIN_USE_UNIVERSE:
-                    symbols = load_universe_from_s3(_registry)
+                    sym_list = load_universe_from_s3(_registry)
                     if TRAIN_MAX_SYMBOLS > 0:
-                        symbols = symbols[:TRAIN_MAX_SYMBOLS]
+                        sym_list = sym_list[:TRAIN_MAX_SYMBOLS]
                 else:
-                    symbols = [s.strip().upper() for s in os.getenv("TRAIN_SYMBOLS","SPY,QQQ,AAPL,MSFT,NVDA").split(",") if s.strip()]
+                    sym_list = [s.strip().upper() for s in os.getenv("TRAIN_SYMBOLS","SPY,QQQ,AAPL,MSFT,NVDA").split(",") if s.strip()]
 
-                print(f"[TRAIN] using {len(symbols)} symbols", flush=True)
+                print(f"[TRAIN] using {len(sym_list)} symbols", flush=True)
 
                 # (3) Train & (maybe) promote per strategy
                 for strat in TRAIN_STRATEGIES:
-                    train_once(strat, symbols)
+                    train_once(strat, sym_list)
 
                 ran_today = True
 
