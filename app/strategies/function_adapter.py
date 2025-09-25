@@ -1,29 +1,26 @@
 from __future__ import annotations
-import importlib, json
+import importlib
 from typing import List, Callable, Any, Dict
 from ..interfaces import Signal, Side, Bar
 
 class FunctionAdapter:
     """
-    Wraps an arbitrary function defined at module:function.
-    The function should accept: (bar_dict, close_history_list) and return:
-      {
-        "side": "buy" | "sell" | None,
-        "confidence": float,
-        "tp_pct": float | 0,
-        "sl_pct": float | 0
-      }
+    Wraps a function at module:function which accepts:
+      (bar_dict, close_history_list) -> dict with keys:
+        side: "buy" | "sell" | None
+        confidence: float
+        tp_pct: float
+        sl_pct: float
     """
     def __init__(self, callable: str, **kwargs):
         mod_path, func_name = callable.split(":")
         mod = importlib.import_module(mod_path)
         self.fn: Callable[[Dict[str, Any], List[float]], Dict[str, Any]] = getattr(mod, func_name)
-        self.extra = kwargs  # ignored by default, there if you need params
 
     def predict(self, bar: Bar, close_history: List[float]) -> Signal:
         b = {
             "symbol": bar.symbol,
-            "ts": bar.ts.isoformat() if hasattr(bar.ts, "isoformat") else bar.ts,
+            "ts": getattr(bar.ts, "isoformat", lambda: str(bar.ts))(),
             "open": float(bar.open),
             "high": float(bar.high),
             "low": float(bar.low),
