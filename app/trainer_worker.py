@@ -202,7 +202,16 @@ def main():
     ran_today = False
     while True:
         try:
-            if _within_window() and not ran_today:
+            now_hm = _now_et_hhmm()
+            within = _within_window()
+            force  = os.getenv("TRAIN_FORCE_RUN", "0").lower() in ("1","true","yes")
+
+            print(f"[TRAINER] tick now={now_hm} within_window={int(within)} force={int(force)} ran_today={int(ran_today)}", flush=True)
+
+            if (within and not ran_today) or force:
+                if force:
+                    print("[TRAINER] FORCE_RUN=1 -> running once now", flush=True)
+
                 # (1) Build tonight's full universe first
                 rebuild_universe_to_s3(_registry)
 
@@ -212,7 +221,6 @@ def main():
                     if TRAIN_MAX_SYMBOLS > 0:
                         symbols = symbols[:TRAIN_MAX_SYMBOLS]
                 else:
-                    # Fallback: tiny fixed set (legacy; generally unused now)
                     symbols = [s.strip().upper() for s in os.getenv("TRAIN_SYMBOLS","SPY,QQQ,AAPL,MSFT,NVDA").split(",") if s.strip()]
 
                 print(f"[TRAIN] using {len(symbols)} symbols", flush=True)
@@ -223,7 +231,7 @@ def main():
 
                 ran_today = True
 
-            if not _within_window():
+            if not within:
                 ran_today = False
 
         except Exception as e:
