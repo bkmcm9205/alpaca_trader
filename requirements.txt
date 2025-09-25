@@ -6,4 +6,4 @@ tzdata>=2024.1
 
 # ML/TA for ranked_ml
 scikit-learn==1.4.2
-pandas_ta @ git+https://github.com/twopirllc/pandas-ta@0.3.14b0
+pandas_ta @ https://github.com/twopirllc/pandas-ta/archive/refs/tags/0.3.14b0.zip
