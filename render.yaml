@@ -1,96 +1,353 @@
 services:
+  # ===========================
+  # TRADER – trading_bot ONLY
+  # ===========================
   - type: worker
-    name: trader
+    name: trader-trading-bot
     env: docker
-    plan: starter
     autoDeploy: true
-    dockerCommand: "python -u -m app.strategy_runner"
+    plan: starter
+    # No startCommand for Docker runtime; Dockerfile CMD runs the app.
     envVars:
+      # --- Alpaca ---
       - key: ALPACA_KEY_ID
-        sync: false
+        fromSecret: alpaca-key-id
       - key: ALPACA_SECRET_KEY
-        sync: false
+        fromSecret: alpaca-secret-key
       - key: ALPACA_PAPER
         value: "true"
       - key: ALPACA_DATA_FEED
-        value: "sip"
-      - key: S3_BUCKET
-        sync: false
-      - key: S3_REGION
-        value: "us-east-2"   
-      - key: S3_BASE_PREFIX
-        value: "models"
-      - key: AWS_ACCESS_KEY_ID
-        sync: false
-      - key: AWS_SECRET_ACCESS_KEY
-        sync: false
-      - key: START_EQUITY
-        value: "100000"
-      - key: DAILY_PROFIT_TARGET_PCT
-        value: "0.10"
-      - key: DAILY_DRAWDOWN_PCT
-        value: "0.05"
-      - key: GUARD_FLATTEN
-        value: "true"
-      - key: EOD_FLATTEN_START_ET
-        value: "16:00"
-      - key: EOD_FLATTEN_END_ET
-        value: "16:10"
-      - key: ORDER_RATE_LIMIT_PM
-        value: "120"
-      - key: STATUS_RATE_LIMIT_PM
-        value: "240"
-      - key: SYMBOLS
-        value: "SPY,QQQ,AAPL,MSFT,NVDA"
-      - key: STRATEGY_NAMES
-        value: "ranked_ml,mean_reversion"
-      - key: S_RANKED_ML_CONF_THR
-        value: "0.7"
-      - key: S_RANKED_ML_SYMBOLS
-        value: "SPY,QQQ,MSFT,NVDA,META,AMZN"
-      - key: S_RANKED_ML_MAX_POSITIONS
-        value: "200"
-      - key: S_RANKED_ML_MIN_PRICE
-        value: "3.0"
-      - key: S_RANKED_ML_SHORTS_ENABLED
-        value: "false"
-      - key: S_MEAN_REV_CONF_THR
-        value: "0.6"
-      - key: S_MEAN_REV_SYMBOLS
-        value: "AAPL,AMD,TSLA"
-      - key: S_MEAN_REV_MAX_POSITIONS
-        value: "50"
-      - key: S_MEAN_REV_MIN_PRICE
-        value: "3.0"
-      - key: S_MEAN_REV_SHORTS_ENABLED
-        value: "false"
+        value: sip
 
+      # --- S3 (read-only) ---
+      - key: S3_BUCKET
+        value: bkm-alpaca-models-01
+      - key: S3_REGION
+        value: us-east-2
+      - key: S3_BASE_PREFIX
+        value: models
+      - key: AWS_ACCESS_KEY_ID
+        fromSecret: aws-access-key-id
+      - key: AWS_SECRET_ACCESS_KEY
+        fromSecret: aws-secret-access-key
+
+      # --- Pre-market-only model reload ---
+      - key: MODEL_RELOAD_WINDOW_ET
+        value: 08:00-09:25
+      - key: MODEL_REFRESH_SEC
+        value: "60"
+
+      # --- Runner config (only trading_bot) ---
+      - key: ACTIVE_STRATEGIES
+        value: trading_bot
+      - key: SCANNER_SYMBOLS
+        value: SPY,AAPL,MSFT,QQQ
+      - key: TF_MIN_LIST
+        value: 1,2,3,5,10
+      - key: RANKED_STRATS
+        value: ""     # not ranked
+      - key: CONF_THR_DEFAULT
+        value: "0.05"
+      - key: CONF_THR_TRADING_BOT
+        value: "0.8"
+      - key: MIN_QTY_DEFAULT
+        value: "1"
+      - key: DRY_RUN
+        value: "1"    # flip to 0 when ready
+      - key: DEDUP_BY_SYMBOL
+        value: "1"
+      - key: SKIP_IF_POSITION_OPEN
+        value: "1"
+      - key: LOOKBACK_MIN
+        value: "2400"
+      - key: POLL_SECONDS
+        value: "10"
+
+      # --- Strategy-internal knobs (keep from your paper setup) ---
+      - key: ALLOWED_EXCHANGES
+        value: NYSE,NASDAQ,NASD,XNYS,XNAS
+      - key: ALLOW_AFTERHOURS
+        value: "0"
+      - key: ALLOW_PREMARKET
+        value: "0"
+      - key: BACKFILL_DAYS
+        value: "5"
+      - key: MIN_PRICE
+        value: "3.0"
+      - key: MIN_QTY
+        value: "1"
+      - key: RISK_PCT
+        value: "0.01"
+      - key: MAX_POS_PCT
+        value: "0.10"
+      - key: ROUND_LOT
+        value: "1"
+      - key: SCANNER_CONF_THRESHOLD
+        value: "0.8"
+      - key: SCANNER_MAX_PAGES
+        value: "7"
+      - key: SCANNER_MIN_TODAY_VOL
+        value: "100000"
+      - key: SCANNER_R_MULTIPLE
+        value: "3.0"
+      - key: SENTIMENT_LOOKBACK_MIN
+        value: "5"
+      - key: SENTIMENT_NEUTRAL_ACTION
+        value: both
+      - key: SENTIMENT_NEUTRAL_BAND
+        value: "0.0015"
+      - key: SENTIMENT_ONLY_GATE
+        value: "1"
+      - key: SENTIMENT_SYMBOLS
+        value: SPY,QQQ
+
+  # ===========================
+  # TRADER – ml_merged ONLY
+  # ===========================
+  - type: worker
+    name: trader-ml-merged
+    env: docker
+    autoDeploy: true
+    plan: starter
+    envVars:
+      # --- Alpaca ---
+      - key: ALPACA_KEY_ID
+        fromSecret: alpaca-key-id
+      - key: ALPACA_SECRET_KEY
+        fromSecret: alpaca-secret-key
+      - key: ALPACA_PAPER
+        value: "true"
+      - key: ALPACA_DATA_FEED
+        value: sip
+
+      # --- S3 (read-only) ---
+      - key: S3_BUCKET
+        value: bkm-alpaca-models-01
+      - key: S3_REGION
+        value: us-east-2
+      - key: S3_BASE_PREFIX
+        value: models
+      - key: AWS_ACCESS_KEY_ID
+        fromSecret: aws-access-key-id
+      - key: AWS_SECRET_ACCESS_KEY
+        fromSecret: aws-secret-access-key
+
+      # --- Pre-market-only model reload ---
+      - key: MODEL_RELOAD_WINDOW_ET
+        value: 08:00-09:25
+      - key: MODEL_REFRESH_SEC
+        value: "60"
+
+      # --- Runner config (only ml_merged) ---
+      - key: ACTIVE_STRATEGIES
+        value: ml_merged
+      - key: SCANNER_SYMBOLS
+        value: SPY,AAPL,MSFT,QQQ
+      - key: TF_MIN_LIST
+        value: 1,2,3,5,10
+      - key: RANKED_STRATS
+        value: ""     # not ranked
+      - key: CONF_THR_DEFAULT
+        value: "0.05"
+      - key: CONF_THR_ML_MERGED
+        value: "0.8"
+      - key: MIN_QTY_DEFAULT
+        value: "1"
+      - key: DRY_RUN
+        value: "1"
+      - key: DEDUP_BY_SYMBOL
+        value: "1"
+      - key: SKIP_IF_POSITION_OPEN
+        value: "1"
+      - key: LOOKBACK_MIN
+        value: "2400"
+      - key: POLL_SECONDS
+        value: "10"
+
+      # --- Strategy-internal knobs (keep) ---
+      - key: ALLOWED_EXCHANGES
+        value: NASD,NASDAQ,NYSE,XNAS,XNYS
+      - key: ALLOW_AFTERHOURS
+        value: "0"
+      - key: ALLOW_PREMARKET
+        value: "0"
+      - key: CONF_THR
+        value: "0.8"
+      - key: SCANNER_MIN_TODAY_VOL
+        value: "500000"
+      - key: SCANNER_MIN_AVG_VOL
+        value: "100000"
+      - key: SCAN_BATCH_SIZE
+        value: "300"
+      - key: MAX_UNIVERSE_PAGES
+        value: "7"
+      - key: R_MULT
+        value: "3.0"
+      - key: SENTIMENT_LOOKBACK_MIN
+        value: "5"
+      - key: SENTIMENT_NEUTRAL_BAND
+        value: "0.0015"
+      - key: SENTIMENT_SYMBOLS
+        value: SPY,QQQ
+      - key: USE_SENTIMENT_REGIME
+        value: "1"
+      - key: PAPER_MODE
+        value: "true"
+      - key: MARKET_TZ
+        value: America/New_York
+      - key: SHORTS_ENABLED
+        value: "1"
+      - key: MIN_PRICE
+        value: "3.0"
+      - key: MIN_QTY
+        value: "1"
+      - key: ROUND_LOT
+        value: "1"
+
+  # ===========================
+  # TRADER – ranked_ml ONLY (RANKED)
+  # ===========================
+  - type: worker
+    name: trader-ranked-ml
+    env: docker
+    autoDeploy: true
+    plan: starter
+    envVars:
+      # --- Alpaca ---
+      - key: ALPACA_KEY_ID
+        fromSecret: alpaca-key-id
+      - key: ALPACA_SECRET_KEY
+        fromSecret: alpaca-secret-key
+      - key: ALPACA_PAPER
+        value: "true"
+      - key: ALPACA_DATA_FEED
+        value: sip
+
+      # --- S3 (read-only) ---
+      - key: S3_BUCKET
+        value: bkm-alpaca-models-01
+      - key: S3_REGION
+        value: us-east-2
+      - key: S3_BASE_PREFIX
+        value: models
+      - key: AWS_ACCESS_KEY_ID
+        fromSecret: aws-access-key-id
+      - key: AWS_SECRET_ACCESS_KEY
+        fromSecret: aws-secret-access-key
+
+      # --- Pre-market-only model reload ---
+      - key: MODEL_RELOAD_WINDOW_ET
+        value: 08:00-09:25
+      - key: MODEL_REFRESH_SEC
+        value: "60"
+
+      # --- Runner config (only ranked_ml, ranked) ---
+      - key: ACTIVE_STRATEGIES
+        value: ranked_ml
+      - key: SCANNER_SYMBOLS
+        value: SPY,AAPL,MSFT,QQQ
+      - key: TF_MIN_LIST
+        value: 1,2,3,5,10
+      - key: RANKED_STRATS
+        value: ranked_ml
+      - key: TOPK_RANKED_DEFAULT
+        value: "1"
+      - key: CONF_THR_DEFAULT
+        value: "0.05"
+      - key: CONF_THR_RANKED_ML
+        value: "0.8"
+      - key: MIN_QTY_DEFAULT
+        value: "1"
+      - key: DRY_RUN
+        value: "1"
+      - key: DEDUP_BY_SYMBOL
+        value: "1"
+      - key: SKIP_IF_POSITION_OPEN
+        value: "1"
+      - key: LOOKBACK_MIN
+        value: "2400"
+      - key: POLL_SECONDS
+        value: "10"
+
+      # --- Strategy-internal knobs (keep) ---
+      - key: ALLOW_AFTERHOURS
+        value: "0"
+      - key: ALLOW_PREMARKET
+        value: "0"
+      - key: ALLOW_EXCHANGES
+        value: XNYS,XNAS
+      - key: MIN_LAST_PRICE
+        value: "3"
+      - key: MIN_TODAY_VOL
+        value: "100000"
+      - key: MIN_AVG_DAILY_VOL
+        value: "200000"
+      - key: SCANNER_CONF_THRESHOLD
+        value: "0.8"
+      - key: SCANNER_MIN_TODAY_VOL
+        value: "100000"
+      - key: SCANNER_MIN_AVG_VOL
+        value: "200000"
+      - key: SCANNER_MAX_PAGES
+        value: "7"
+      - key: SCANNER_R_MULTIPLE
+        value: "3.0"
+      - key: SCAN_BATCH_SIZE
+        value: "300"
+      - key: SENTIMENT_LOOKBACK_MIN
+        value: "5"
+      - key: SENTIMENT_SYMBOLS
+        value: SPY,QQQ
+      - key: SHORTS_ENABLED
+        value: "1"
+      - key: TF_MIN_LIST
+        value: 1,2,3,5,10
+
+  # ===========================
+  # TRAINER – after-hours S3 promotion
+  # ===========================
   - type: worker
     name: trainer
     env: docker
-    plan: starter
     autoDeploy: true
-    dockerCommand: "python -u -m app.trainer_worker"
+    plan: starter
     envVars:
+      # --- Alpaca (if trainer fetches data) ---
       - key: ALPACA_KEY_ID
-        sync: false
+        fromSecret: alpaca-key-id
       - key: ALPACA_SECRET_KEY
-        sync: false
+        fromSecret: alpaca-secret-key
       - key: ALPACA_PAPER
         value: "true"
       - key: ALPACA_DATA_FEED
-        value: "sip"
+        value: sip
+
+      # --- S3 (read/write) ---
       - key: S3_BUCKET
-        sync: false
+        value: bkm-alpaca-models-01
       - key: S3_REGION
-        value: "us-east-2"   
+        value: us-east-2
       - key: S3_BASE_PREFIX
-        value: "models"
+        value: models
       - key: AWS_ACCESS_KEY_ID
-        sync: false
+        fromSecret: aws-access-key-id
       - key: AWS_SECRET_ACCESS_KEY
-        sync: false
-      - key: SYMBOLS
-        value: "SPY,QQQ,AAPL,MSFT,NVDA"
-      - key: STRATEGY_NAMES
-        value: "ranked_ml,mean_reversion"
+        fromSecret: aws-secret-access-key
+
+      # --- Training window (ET) ---
+      - key: TRAIN_RUN_START_ET
+        value: 19:00
+      - key: TRAIN_RUN_END_ET
+        value: 20:00
+      - key: TRAINER_SLEEP_SEC
+        value: "60"
+
+      # --- What to train ---
+      - key: TRAIN_STRATEGIES
+        value: ranked_ml,ml_merged
+      - key: TRAIN_SYMBOLS
+        value: SPY,QQQ,AAPL,MSFT,NVDA
+      - key: TRAIN_TFS
+        value: 5,15
+      - key: TRAIN_METRIC
+        value: score
