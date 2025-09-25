@@ -1,0 +1,89 @@
+services:
+  - type: worker
+    name: trader
+    env: docker
+    plan: starter
+    autoDeploy: true
+    startCommand: "python -u -m app.strategy_runner"
+    envVars:
+      - key: ALPACA_KEY_ID
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: ALPACA_PAPER
+        value: "true"     # start in paper
+      - key: ALPACA_DATA_FEED
+        value: "sip"
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_REGION
+        value: "us-east-1"
+      - key: S3_BASE_PREFIX
+        value: "models"
+      - key: START_EQUITY
+        value: "100000"
+      - key: DAILY_PROFIT_TARGET_PCT
+        value: "0.10"
+      - key: DAILY_DRAWDOWN_PCT
+        value: "0.05"
+      - key: GUARD_FLATTEN
+        value: "true"
+      - key: EOD_FLATTEN_START_ET
+        value: "16:00"
+      - key: EOD_FLATTEN_END_ET
+        value: "16:10"
+      - key: ORDER_RATE_LIMIT_PM
+        value: "120"
+      - key: STATUS_RATE_LIMIT_PM
+        value: "240"
+      - key: SYMBOLS
+        value: "SPY,QQQ,AAPL,MSFT,NVDA"
+      - key: STRATEGY_NAMES
+        value: "ranked_ml,mean_reversion"
+      # Per-strategy overrides (no code edits)
+      - key: S_RANKED_ML_CONF_THR
+        value: "0.7"
+      - key: S_RANKED_ML_SYMBOLS
+        value: "SPY,QQQ,MSFT,NVDA,META,AMZN"
+      - key: S_RANKED_ML_MAX_POSITIONS
+        value: "200"
+      - key: S_RANKED_ML_MIN_PRICE
+        value: "3.0"
+      - key: S_RANKED_ML_SHORTS_ENABLED
+        value: "false"
+      - key: S_MEAN_REV_CONF_THR
+        value: "0.6"
+      - key: S_MEAN_REV_SYMBOLS
+        value: "AAPL,AMD,TSLA"
+      - key: S_MEAN_REV_MAX_POSITIONS
+        value: "50"
+      - key: S_MEAN_REV_MIN_PRICE
+        value: "3.0"
+      - key: S_MEAN_REV_SHORTS_ENABLED
+        value: "false"
+
+  - type: worker
+    name: trainer
+    env: docker
+    plan: starter
+    autoDeploy: true
+    startCommand: "python -u -m app.trainer_worker"
+    envVars:
+      - key: ALPACA_KEY_ID
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: ALPACA_PAPER
+        value: "true"
+      - key: ALPACA_DATA_FEED
+        value: "sip"
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_REGION
+        value: "us-east-1"
+      - key: S3_BASE_PREFIX
+        value: "models"
+      - key: SYMBOLS
+        value: "SPY,QQQ,AAPL,MSFT,NVDA"
+      - key: STRATEGY_NAMES
+        value: "ranked_ml,mean_reversion"
