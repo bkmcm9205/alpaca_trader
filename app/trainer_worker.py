@@ -54,8 +54,6 @@ U_MIN_TODAY_VOL = int(os.getenv("UNIVERSE_MIN_TODAY_VOL", "0"))
 # NEW: mode = "assets" (default for reliability) or "snapshots" (apply filters by price/volume)
 UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "assets").strip().lower()
 
-rule = f"{tf_min}min"
-
 # =========================
 # UTIL
 # =========================
@@ -198,7 +196,13 @@ def _aggregate_bars(symbol: str, tf_min: int, lookback_min: int = 7*24*60) -> pd
     if tf_min <= 1:
         return df
     rule = f"{tf_min}min"   # 'T' deprecated; use 'min'
-    agg = df.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+    agg = df.resample(rule).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
+    }).dropna()
     return agg
 
 def _toy_fit(symbols: List[str], tfs: List[int]) -> tuple[bytes, dict]:
