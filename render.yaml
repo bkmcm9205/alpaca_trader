@@ -1,16 +1,14 @@
 services:
-  # ===========================
-  # TRADER – trading_bot ONLY
-  # ===========================
+  # ===== TRADER – trading_bot =====
   - type: worker
     name: trader-trading-bot
     env: docker
-    autoDeploy: true
     plan: starter
+    autoDeploy: true
     envVars:
-      - fromGroup: common-secrets  # ALPACA_* and AWS_* live here
+      - fromGroup: common-secrets
 
-      # --- S3 read-only + universe file ---
+      # S3 (read-only) + universe file
       - key: S3_BUCKET
         value: bkm-alpaca-models-01
       - key: S3_REGION
@@ -21,20 +19,22 @@ services:
         value: models/universe/daily.csv
       - key: UNIVERSE_RELOAD_WINDOW_ET
         value: 08:00-09:25
+      - key: UNIVERSE_REFRESH_SEC
+        value: "60"
 
-      # --- Pre-market-only model reload ---
+      # Pre-market model reload
       - key: MODEL_RELOAD_WINDOW_ET
         value: 08:00-09:25
       - key: MODEL_REFRESH_SEC
         value: "60"
 
-      # --- Runner config (only trading_bot) ---
+      # Runner config (only trading_bot; not ranked)
       - key: ACTIVE_STRATEGIES
         value: trading_bot
       - key: TF_MIN_LIST
         value: 1,2,3,5,10
       - key: RANKED_STRATS
-        value: ""     # not ranked
+        value: ""
       - key: CONF_THR_DEFAULT
         value: "0.05"
       - key: CONF_THR_TRADING_BOT
@@ -42,7 +42,7 @@ services:
       - key: MIN_QTY_DEFAULT
         value: "1"
       - key: DRY_RUN
-        value: "1"    # flip to 0 when ready
+        value: "1"
       - key: DEDUP_BY_SYMBOL
         value: "1"
       - key: SKIP_IF_POSITION_OPEN
@@ -52,7 +52,7 @@ services:
       - key: POLL_SECONDS
         value: "10"
 
-      # --- Strategy-internal knobs (keep) ---
+      # Strategy-internal knobs you used before
       - key: ALLOWED_EXCHANGES
         value: NYSE,NASDAQ,NASD,XNYS,XNAS
       - key: ALLOW_AFTERHOURS
@@ -90,14 +90,12 @@ services:
       - key: SENTIMENT_SYMBOLS
         value: SPY,QQQ
 
-  # ===========================
-  # TRADER – ml_merged ONLY
-  # ===========================
+  # ===== TRADER – ml_merged =====
   - type: worker
     name: trader-ml-merged
     env: docker
-    autoDeploy: true
     plan: starter
+    autoDeploy: true
     envVars:
       - fromGroup: common-secrets
 
@@ -111,6 +109,8 @@ services:
         value: models/universe/daily.csv
       - key: UNIVERSE_RELOAD_WINDOW_ET
         value: 08:00-09:25
+      - key: UNIVERSE_REFRESH_SEC
+        value: "60"
 
       - key: MODEL_RELOAD_WINDOW_ET
         value: 08:00-09:25
@@ -122,7 +122,7 @@ services:
       - key: TF_MIN_LIST
         value: 1,2,3,5,10
       - key: RANKED_STRATS
-        value: ""     # not ranked
+        value: ""
       - key: CONF_THR_DEFAULT
         value: "0.05"
       - key: CONF_THR_ML_MERGED
@@ -140,7 +140,6 @@ services:
       - key: POLL_SECONDS
         value: "10"
 
-      # --- Strategy-internal knobs (keep) ---
       - key: ALLOWED_EXCHANGES
         value: NASD,NASDAQ,NYSE,XNAS,XNYS
       - key: ALLOW_AFTERHOURS
@@ -180,14 +179,12 @@ services:
       - key: ROUND_LOT
         value: "1"
 
-  # ===========================
-  # TRADER – ranked_ml ONLY (RANKED)
-  # ===========================
+  # ===== TRADER – ranked_ml (ranked) =====
   - type: worker
     name: trader-ranked-ml
     env: docker
-    autoDeploy: true
     plan: starter
+    autoDeploy: true
     envVars:
       - fromGroup: common-secrets
 
@@ -201,6 +198,8 @@ services:
         value: models/universe/daily.csv
       - key: UNIVERSE_RELOAD_WINDOW_ET
         value: 08:00-09:25
+      - key: UNIVERSE_REFRESH_SEC
+        value: "60"
 
       - key: MODEL_RELOAD_WINDOW_ET
         value: 08:00-09:25
@@ -232,7 +231,6 @@ services:
       - key: POLL_SECONDS
         value: "10"
 
-      # --- Strategy-internal knobs (keep) ---
       - key: ALLOW_AFTERHOURS
         value: "0"
       - key: ALLOW_PREMARKET
@@ -266,14 +264,12 @@ services:
       - key: TF_MIN_LIST
         value: 1,2,3,5,10
 
-  # ===========================
-  # TRAINER – after-hours S3 promotion
-  # ===========================
+  # ===== TRAINER (after-hours) =====
   - type: worker
     name: trainer
     env: docker
-    autoDeploy: true
     plan: starter
+    autoDeploy: true
     envVars:
       - fromGroup: common-secrets
 
@@ -284,13 +280,27 @@ services:
       - key: S3_BASE_PREFIX
         value: models
 
-      # Training window (ET)
+      # Nightly universe + training window
       - key: TRAIN_RUN_START_ET
         value: 19:00
       - key: TRAIN_RUN_END_ET
         value: 20:00
       - key: TRAINER_SLEEP_SEC
         value: "60"
+
+      # Universe builder settings
+      - key: UNIVERSE_S3_WRITE_KEY
+        value: models/universe/daily.csv
+      - key: UNIVERSE_BATCH
+        value: "400"
+      - key: UNIVERSE_MAX
+        value: "8000"
+      - key: UNIVERSE_MIN_LAST_PRICE
+        value: "3"
+      - key: UNIVERSE_MIN_AVG_VOL
+        value: "200000"
+      - key: UNIVERSE_MIN_TODAY_VOL
+        value: "100000"
 
       # What to train
       - key: TRAIN_STRATEGIES
