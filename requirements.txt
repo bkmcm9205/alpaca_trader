@@ -1,9 +1,9 @@
-# Core
+# requirements.txt
 pandas==2.2.2
+numpy==1.26.4
 requests>=2.31.0
 boto3>=1.34.0
 tzdata>=2024.1
 
-# ML/TA for ranked_ml
+# ML used by ranked_ml and others
 scikit-learn==1.4.2
-pandas_ta @ git+https://github.com/twopirllc/pandas-ta@master
