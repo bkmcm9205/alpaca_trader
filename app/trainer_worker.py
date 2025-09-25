@@ -54,6 +54,8 @@ U_MIN_TODAY_VOL = int(os.getenv("UNIVERSE_MIN_TODAY_VOL", "0"))
 # NEW: mode = "assets" (default for reliability) or "snapshots" (apply filters by price/volume)
 UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "assets").strip().lower()
 
+rule = f"{tf_min}min"
+
 # =========================
 # UTIL
 # =========================
@@ -103,17 +105,25 @@ def _snapshots_batch(symbols: List[str]) -> dict:
     return out
 
 def rebuild_universe_to_s3(registry: S3ModelRegistry):
+    """Assets-only mode: write all active, tradable US equities to S3."""
     if not (S3_BUCKET and S3_REGION and UNIVERSE_WRITE_KEY):
         print("[UNIVERSE] S3 not configured; skipping", flush=True)
         return
-
-    # (A) Base list of tradable US equities
     try:
-        symbols = _list_us_equities()
-        print(f"[UNIVERSE] assets: got {len(symbols)} tradable symbols", flush=True)
+        # List active tradable US equities (capped by UNIVERSE_MAX)
+        url = f"{ALPACA_TRADING_BASE}/v2/assets"
+        params = {"asset_class": "us_equity", "status": "active"}
+        r = requests.get(url, headers=_auth_headers(), params=params, timeout=60)
+        r.raise_for_status()
+        assets = r.json()
+        syms = [str(a.get("symbol","")).upper().strip() for a in assets if a.get("tradable")]
+        keep = syms[:UNIVERSE_MAX]
+        print(f"[UNIVERSE] assets-only -> keep {len(keep)} symbols", flush=True)
+        csv_bytes = ("\n".join(sorted(set(keep))) + "\n").encode("utf-8")
+        registry.s3.put_object(Bucket=S3_BUCKET, Key=UNIVERSE_WRITE_KEY, Body=csv_bytes)
+        print(f"[UNIVERSE] wrote {len(set(keep))} symbols to s3://{S3_BUCKET}/{UNIVERSE_WRITE_KEY}", flush=True)
     except Exception as e:
-        print(f"[UNIVERSE] error listing assets: {e}", flush=True)
-        return
+        print(f"[UNIVERSE] assets-only error: {e}", flush=True)
 
     keep: List[str] = []
 
