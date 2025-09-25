@@ -1,161 +1,177 @@
-from __future__ import annotations
-import os, time, logging
-from typing import Dict
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+import os, time, importlib
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, List
 
-import numpy as np
+import pandas as pd
 
-from .config import Config, StrategyCfg
-from .logutil import setup_logging
-from .interfaces import Bar, Side, Signal, OrderIntent
-from .stream_hub import StreamHub
-from .broker_alpaca import BrokerAlpaca
-from .model_registry_s3 import S3ModelRegistry
-from .throttler import PerMinuteLimiter
+from app.data_alpaca import fetch_alpaca_1m
+from app.broker_alpaca import place_bracket_order, get_positions_symbols
+from app.strategy_registry import ADAPTERS
 
-log = logging.getLogger("strategy_runner")
+# -------- ENV (tune from Render) ----------
+SYMBOLS = [s.strip().upper() for s in os.getenv("SCANNER_SYMBOLS","SPY,QQQ").split(",") if s.strip()]
+TF_MIN_LIST = [int(x) for x in os.getenv("TF_MIN_LIST","5,15").split(",") if x.strip()]
+ACTIVE = [s.strip() for s in os.getenv("ACTIVE_STRATEGIES","trading_bot,ml_merged,ranked_ml").split(",") if s.strip()]
+LOOKBACK_MIN = int(os.getenv("LOOKBACK_MIN","2400"))     # ~40h of 1m bars
+POLL_SECONDS = int(os.getenv("POLL_SECONDS","20"))
 
-# ----- Simple fallback "model" if none in S3 -----
-class SimpleMomentumModel:
-    def predict(self, bar: Bar) -> Signal:
-        # toy: if close made a new minute high vs open -> BUY; else no action
-        side = Side.BUY if bar.close > bar.open else None
-        conf = abs(bar.close - bar.open) / max(bar.open, 1e-6)
-        return Signal(symbol=bar.symbol, side=side, confidence=float(conf), take_profit_pct=0.03, stop_loss_pct=0.01)
+DRY_RUN = os.getenv("DRY_RUN","1") in ("1","true","True")
+DEDUP_BY_SYMBOL = os.getenv("DEDUP_BY_SYMBOL","1") in ("1","true","True")
+SKIP_IF_POSITION_OPEN = os.getenv("SKIP_IF_POSITION_OPEN","1") in ("1","true","True")
 
-# ----- Per-strategy engine -----
-class Engine:
-    def __init__(self, cfg: Config, scfg: StrategyCfg, broker: BrokerAlpaca, registry: S3ModelRegistry):
-        self.cfg = cfg
-        self.scfg = scfg
-        self.broker = broker
-        self.registry = registry
-        self.model = self._load_model()
-        self.et = ZoneInfo("America/New_York")
-        self.open_positions: Dict[str,int] = {}
-        self.no_more_entries_today = False
-        self.order_throttle = PerMinuteLimiter(max(1, cfg.order_rate_per_min // max(1, len(cfg.strategies))))
+# 🔑 Only these strategies are ranked. Default: ranked_ml only.
+RANKED_STRATS = [s.strip() for s in os.getenv("RANKED_STRATS","ranked_ml").split(",") if s.strip()]
 
-        log.info(f"[{scfg.name}] engine ready. shorts={scfg.allow_shorts} conf_thr={scfg.conf_thr} max_pos={scfg.max_positions}")
+# Defaults / per-strategy overrides
+TOPK_RANKED_DEFAULT = int(os.getenv("TOPK_RANKED_DEFAULT","1"))       # used if TOPK_<STRAT> not set (for ranked strats)
+CONF_THR_DEFAULT = float(os.getenv("CONF_THR_DEFAULT","0.05"))
+MIN_QTY_DEFAULT = int(os.getenv("MIN_QTY_DEFAULT","1"))
+# For non-ranked strats, we don't cap unless TOPK_<STRAT> is set
+_NONRANK_BIG = 10**9
 
-    def _load_model(self):
-        try:
-            if self.scfg.model_key:
-                # allow explicit key override like models/<strategy>/production/model.pkl
-                s3key = self.scfg.model_key
-                # If it's a prefix, use registry loader; else direct get_object is also fine
-            return self.registry.load_production(self.scfg.name)
-        except Exception as e:
-            log.warning(f"[{self.scfg.name}] no production model, using SimpleMomentumModel. ({e})")
-            return SimpleMomentumModel()
+def _per_strat(key: str, strat: str, cast, default):
+    env_key = f"{key}_{strat.upper()}"
+    v = os.getenv(env_key)
+    return cast(v) if v is not None else default
 
-    def _guard_window_now(self):
-        now_et = datetime.now(self.et).time()
-        s = self.cfg.eod_flatten_start_et
-        e = self.cfg.eod_flatten_end_et
-        return s <= now_et.strftime("%H:%M") <= e
+@dataclass
+class Candidate:
+    strategy: str
+    symbol: str
+    tf: int
+    confidence: float
+    side: str
+    qty: int
+    tp: float | None
+    sl: float | None
+    last: float
 
-    def _daily_guard_check(self) -> bool:
-        """True if guard breached; handles flatten+halt if configured."""
-        try:
-            eq = self.broker.get_equity()
-        except Exception:
-            log.exception("[GUARD] could not fetch equity; skipping")
-            return False
-        up_target = self.cfg.start_equity_usd * (1.0 + self.cfg.pt_up_pct)
-        dn_target = self.cfg.start_equity_usd * (1.0 - self.cfg.dd_down_pct)
-        if eq >= up_target:
-            log.warning(f"[GUARD] Profit target met: eq={eq:.2f} >= {up_target:.2f}")
-            if self.cfg.kill_on_guard:
-                self.broker.flatten_all()
-                self.no_more_entries_today = True
-            return True
-        if eq <= dn_target:
-            log.warning(f"[GUARD] Drawdown breached: eq={eq:.2f} <= {dn_target:.2f}")
-            if self.cfg.kill_on_guard:
-                self.broker.flatten_all()
-                self.no_more_entries_today = True
-            return True
-        return False
+def _load_adapters():
+    mods = {}
+    for name in ACTIVE:
+        path = ADAPTERS.get(name)
+        if not path: 
+            print(f"[BOOT] WARNING: no adapter mapped for strategy '{name}'", flush=True)
+            continue
+        mods[name] = importlib.import_module(path)
+    return mods
 
-    def process_bar(self, bar: Bar):
-        try:
-            # EOD flatten window
-            if self._guard_window_now():
-                self.broker.flatten_all()
-                self.no_more_entries_today = True
-                return
+def _norm_qty(q, strat):
+    try:
+        q = int(q or 0)
+    except Exception:
+        q = 0
+    return q if q > 0 else _per_strat("MIN_QTY", strat, int, MIN_QTY_DEFAULT)
 
-            # Daily guard
-            if self._daily_guard_check():
-                return
+def scan_once(adapters) -> List[Candidate]:
+    candidates: List[Candidate] = []
+    open_syms = get_positions_symbols() if SKIP_IF_POSITION_OPEN else set()
 
-            # If halted, do not enter
-            if self.no_more_entries_today:
-                return
+    for sym in SYMBOLS:
+        df1m = fetch_alpaca_1m(sym, limit=LOOKBACK_MIN)
+        if df1m is None or df1m.empty:
+            continue
+        last = float(df1m["close"].iloc[-1])
 
-            # Basic symbol gates
-            if bar.close < self.scfg.min_price:
-                return
+        for tf in TF_MIN_LIST:
+            for strat, mod in adapters.items():
+                dec = getattr(mod, "decide", None)
+                if not dec:
+                    continue
 
-            # Model decision
-            sig: Signal = self.model.predict(bar)
-            if sig.side is None or sig.confidence < self.scfg.conf_thr:
-                return
+                try:
+                    sig = dec(sym, df1m, tf)
+                except Exception as e:
+                    print(f"[{strat}] decide error {sym}:{tf}m -> {e}", flush=True)
+                    continue
 
-            # Position gating
-            if len(self.open_positions) >= self.scfg.max_positions:
-                return
+                if not sig:
+                    continue
 
-            # Position sizing: naive fixed notional / price
-            notional = max(1000.0, self.cfg.start_equity_usd * 0.005)  # ~0.5% slice
-            qty = int(max(1, notional // max(bar.close, 1.0)))
+                conf = float(sig.get("confidence", 0.0) or 0.0)
+                thr  = _per_strat("CONF_THR", strat, float, CONF_THR_DEFAULT)
+                if conf < thr:
+                    continue
 
-            # Throttle orders
-            if not self.order_throttle.allow():
-                return
+                side = str(sig.get("side","")).lower()
+                if side not in ("buy","sell"):
+                    continue
 
-            oi = OrderIntent(
-                symbol=bar.symbol,
-                qty=qty,
-                side=sig.side,
-                take_profit_pct=float(sig.take_profit_pct),
-                stop_loss_pct=float(sig.stop_loss_pct),
-            )
-            o = self.broker.submit_market(oi)
-            if o:
-                self.open_positions[bar.symbol] = self.open_positions.get(bar.symbol, 0) + qty
+                if SKIP_IF_POSITION_OPEN and side == "buy" and sym in open_syms:
+                    # simple long-only skip if already in a long; adjust if you run shorts
+                    continue
 
-        except Exception:
-            log.exception(f"[{self.scfg.name}] process_bar error")
+                qty = _norm_qty(sig.get("quantity"), strat)
+                tp = sig.get("takeProfit")
+                sl = sig.get("stopLoss")
+
+                candidates.append(Candidate(
+                    strategy=strat, symbol=sym, tf=tf, confidence=conf,
+                    side=side, qty=qty, tp=tp, sl=sl, last=last
+                ))
+    return candidates
+
+def rank_and_execute(candidates: List[Candidate]):
+    if not candidates:
+        print("[RANK] no candidates", flush=True)
+        return
+
+    grouped: Dict[str, List[Candidate]] = defaultdict(list)
+    for c in candidates:
+        grouped[c.strategy].append(c)
+
+    orders: List[Candidate] = []
+
+    for strat, items in grouped.items():
+        ranked_mode = strat in RANKED_STRATS
+
+        # Optional de-dup to 1 per symbol (keep highest confidence)
+        if DEDUP_BY_SYMBOL:
+            best_by_symbol: Dict[str, Candidate] = {}
+            for c in items:
+                cur = best_by_symbol.get(c.symbol)
+                if cur is None or c.confidence > cur.confidence:
+                    best_by_symbol[c.symbol] = c
+            items = list(best_by_symbol.values())
+
+        # Sort by confidence (desc) so either mode is consistent
+        items.sort(key=lambda x: x.confidence, reverse=True)
+
+        if ranked_mode:
+            # Rank-and-take-topK ONLY for ranked_ml (or whatever is in RANKED_STRATS)
+            topk = _per_strat("TOPK", strat, int, TOPK_RANKED_DEFAULT)
+            take = items[:max(0, topk)]
+            print(f"[RANK] {strat}: {len(items)} candidates -> taking top {len(take)}", flush=True)
+            orders.extend(take)
+        else:
+            # Non-ranked strategies: execute everything (unless TOPK_<STRAT> is set)
+            topk = _per_strat("TOPK", strat, int, _NONRANK_BIG)
+            take = items[:max(0, topk)]
+            print(f"[PASS] {strat}: {len(items)} candidates -> passing {len(take)}", flush=True)
+            orders.extend(take)
+
+    # Execute (or dry-run)
+    for o in orders:
+        if DRY_RUN:
+            print(f"[DRY] {o.strategy} conf={o.confidence:.4f} {o.symbol}:{o.tf}m side={o.side} qty={o.qty} tp={o.tp} sl={o.sl}", flush=True)
+        else:
+            ok, info = place_bracket_order(o.symbol, o.side, o.qty, o.last, o.tp, o.sl)
+            print(f"[ORDER] {o.strategy} {o.symbol}:{o.tf}m conf={o.confidence:.4f} side={o.side} qty={o.qty} ok={ok} info={str(info)[:160]}", flush=True)
 
 def main():
-    cfg = Config.load_from_env()
-    setup_logging(cfg.diag_verbose)
+    adapters = _load_adapters()
+    print(f"[BOOT] ACTIVE={list(adapters.keys())} SYMBOLS={SYMBOLS} TFs={TF_MIN_LIST} DRY_RUN={int(DRY_RUN)} RANKED_STRATS={RANKED_STRATS}", flush=True)
 
-    log.info("[BOOT] Strategy Runner starting…")
-    broker = BrokerAlpaca(cfg.alpaca_key_id, cfg.alpaca_secret_key, cfg.alpaca_paper,
-                          cfg.order_rate_per_min, cfg.status_rate_per_min)
-    registry = S3ModelRegistry(cfg.s3_bucket, cfg.s3_region, cfg.s3_base_prefix)
-
-    hub = StreamHub(cfg)
-
-    # Instantiate one Engine per strategy
-    engines = []
-    for name, scfg in cfg.strategies.items():
-        eng = Engine(cfg, scfg, broker, registry)
-        engines.append(eng)
-        hub.register(eng.process_bar)
-
-    # Symbols: union of per-strategy overrides or hub default
-    all_syms = set(cfg.hub_symbols)
-    for scfg in cfg.strategies.values():
-        if scfg.symbols:
-            all_syms.update(scfg.symbols)
-
-    hub.start(sorted(all_syms))
-    hub.join()
+    while True:
+        start = time.time()
+        try:
+            cands = scan_once(adapters)
+            rank_and_execute(cands)
+        except Exception as e:
+            print(f"[LOOP ERROR] {e}", flush=True)
+        elapsed = time.time() - start
+        time.sleep(max(1, POLL_SECONDS - int(elapsed)))
 
 if __name__ == "__main__":
     main()
