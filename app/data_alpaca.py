@@ -45,6 +45,8 @@ def fetch_alpaca_1m(symbol: str, limit: int = 1500, end: Optional[datetime] = No
     Fetch up to `limit` 1-minute bars for `symbol` from Alpaca, newest-first up to `end` (UTC).
     Handles pagination via next_page_token. Returns a tz-aware UTC-indexed DataFrame.
     """
+    # Normalize symbol: strip BOM/whitespace and uppercase
+    symbol = (symbol or "").replace("\ufeff", "").strip().upper()
     if not symbol:
         return pd.DataFrame()
     if not ALPACA_KEY or not ALPACA_SECRET:
