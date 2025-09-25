@@ -44,12 +44,15 @@ TRAIN_MAX_SYMBOLS  = int(os.getenv("TRAIN_MAX_SYMBOLS", "0"))  # 0 = no cap
 
 # Nightly universe builder config
 UNIVERSE_WRITE_KEY = os.getenv("UNIVERSE_S3_WRITE_KEY", "models/universe/daily.csv")
-UNIVERSE_BATCH     = int(os.getenv("UNIVERSE_BATCH", "400"))
+UNIVERSE_BATCH     = int(os.getenv("UNIVERSE_BATCH", "200"))  # smaller, safer batching
 UNIVERSE_MAX       = int(os.getenv("UNIVERSE_MAX", "8000"))
 
 U_MIN_PRICE     = float(os.getenv("UNIVERSE_MIN_LAST_PRICE", "1"))
 U_MIN_AVG_VOL   = int(os.getenv("UNIVERSE_MIN_AVG_VOL", "0"))
 U_MIN_TODAY_VOL = int(os.getenv("UNIVERSE_MIN_TODAY_VOL", "0"))
+
+# NEW: mode = "assets" (default for reliability) or "snapshots" (apply filters by price/volume)
+UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "assets").strip().lower()
 
 # =========================
 # UTIL
@@ -66,7 +69,7 @@ def _auth_headers() -> Dict[str, str]:
     return {"Apca-Api-Key-Id": ALPACA_KEY, "Apca-Api-Secret-Key": ALPACA_SECRET, "accept": "application/json"}
 
 # =========================
-# UNIVERSE BUILDER (Alpaca-only)
+# UNIVERSE SOURCES (Alpaca-only)
 # =========================
 
 def _list_us_equities() -> List[str]:
@@ -75,57 +78,81 @@ def _list_us_equities() -> List[str]:
     r = requests.get(url, headers=_auth_headers(), params=params, timeout=60)
     r.raise_for_status()
     assets = r.json()
-    syms = [a["symbol"].upper() for a in assets if a.get("tradable")]
+    syms = [a["symbol"].upper().strip() for a in assets if a.get("tradable")]
     return syms[:UNIVERSE_MAX]
 
 def _snapshots_batch(symbols: List[str]) -> dict:
+    """Return mapping symbol -> snapshot, tolerant to API shape."""
+    if not symbols:
+        return {}
     url = f"{ALPACA_DATA_BASE}/v2/stocks/snapshots"
     params = {"symbols": ",".join(symbols), "feed": "sip"}
-    r = requests.get(url, headers=_auth_headers(), params=params, timeout=60)
+    r = requests.get(url, headers=_auth_headers(), params=params, timeout=90)
     r.raise_for_status()
-    return r.json().get("snapshots", {})
+    data = r.json() or {}
+    snaps = data.get("snapshots", {})
+    if isinstance(snaps, dict):
+        return snaps
+    # Some variants return a list of { "symbol": "AAPL", ... }
+    out = {}
+    if isinstance(snaps, list):
+        for item in snaps:
+            sym = str(item.get("symbol","")).upper().strip()
+            if sym:
+                out[sym] = item
+    return out
 
 def rebuild_universe_to_s3(registry: S3ModelRegistry):
     if not (S3_BUCKET and S3_REGION and UNIVERSE_WRITE_KEY):
         print("[UNIVERSE] S3 not configured; skipping", flush=True)
         return
 
+    # (A) Base list of tradable US equities
     try:
         symbols = _list_us_equities()
+        print(f"[UNIVERSE] assets: got {len(symbols)} tradable symbols", flush=True)
     except Exception as e:
         print(f"[UNIVERSE] error listing assets: {e}", flush=True)
         return
 
     keep: List[str] = []
-    for i in range(0, len(symbols), UNIVERSE_BATCH):
-        batch = symbols[i:i+UNIVERSE_BATCH]
-        try:
-            snaps = _snapshots_batch(batch)
-        except Exception as e:
-            print(f"[UNIVERSE] snapshots error on batch {i//UNIVERSE_BATCH+1}: {e}", flush=True)
-            time.sleep(0.5)
-            continue
 
-        for sym in batch:
-            s = snaps.get(sym)
-            if not s:
+    if UNIVERSE_MODE == "assets":
+        # Keep everything (cap by UNIVERSE_MAX already applied)
+        keep = symbols.copy()
+        print(f"[UNIVERSE] mode=assets -> keep all {len(keep)} symbols", flush=True)
+    else:
+        # (B) snapshots filtering by price/volume
+        for i in range(0, len(symbols), UNIVERSE_BATCH):
+            batch = symbols[i:i+UNIVERSE_BATCH]
+            try:
+                snaps = _snapshots_batch(batch)
+            except Exception as e:
+                print(f"[UNIVERSE] snapshots error on batch {i//UNIVERSE_BATCH+1}: {e}", flush=True)
+                time.sleep(0.5)
                 continue
-            prev = (s.get("prevDailyBar") or {})
-            last_close = float(prev.get("c") or 0.0)
-            prev_vol   = int(prev.get("v") or 0)
-            daily = (s.get("dailyBar") or {})
-            today_vol = int(daily.get("v") or 0)
 
-            if last_close >= U_MIN_PRICE and prev_vol >= U_MIN_AVG_VOL and today_vol >= U_MIN_TODAY_VOL:
-                keep.append(sym)
+            for sym in batch:
+                s = snaps.get(sym)
+                if not s:
+                    continue
+                prev = (s.get("prevDailyBar") or {})
+                last_close = float(prev.get("c") or 0.0)
+                prev_vol   = int(prev.get("v") or 0)
+                daily = (s.get("dailyBar") or {})
+                today_vol = int(daily.get("v") or 0)
 
-        print(f"[UNIVERSE] batch {i//UNIVERSE_BATCH+1}: kept_so_far={len(keep)}", flush=True)
-        time.sleep(0.25)
+                if last_close >= U_MIN_PRICE and prev_vol >= U_MIN_AVG_VOL and today_vol >= U_MIN_TODAY_VOL:
+                    keep.append(sym)
 
-    if not keep:
-        print("[UNIVERSE] Filter produced 0 symbols; writing fallback SPY,QQQ", flush=True)
-        keep = ["SPY","QQQ"]
+            print(f"[UNIVERSE] batch {i//UNIVERSE_BATCH+1}: kept_so_far={len(keep)}", flush=True)
+            time.sleep(0.15)
 
+        if not keep:
+            print("[UNIVERSE] snapshots filter produced 0 symbols; falling back to assets list", flush=True)
+            keep = symbols.copy()
+
+    # Write to S3
     try:
         csv_bytes = ("\n".join(sorted(set(keep))) + "\n").encode("utf-8")
         registry.s3.put_object(Bucket=S3_BUCKET, Key=UNIVERSE_WRITE_KEY, Body=csv_bytes)
@@ -160,7 +187,7 @@ def _aggregate_bars(symbol: str, tf_min: int, lookback_min: int = 7*24*60) -> pd
         return pd.DataFrame()
     if tf_min <= 1:
         return df
-    rule = f"{tf_min}T"
+    rule = f"{tf_min}min"   # 'T' deprecated; use 'min'
     agg = df.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
     return agg
 
@@ -197,7 +224,7 @@ def main():
     if not (S3_BUCKET and S3_REGION):
         print("[BOOT] Missing S3 config; set S3_BUCKET / S3_REGION", flush=True)
 
-    print(f"[TRAINER] start strategies={TRAIN_STRATEGIES} tfs={TRAIN_TFS} use_universe={int(TRAIN_USE_UNIVERSE)}", flush=True)
+    print(f"[TRAINER] start strategies={TRAIN_STRATEGIES} tfs={TRAIN_TFS} use_universe={int(TRAIN_USE_UNIVERSE)} mode={UNIVERSE_MODE}", flush=True)
 
     ran_today = False
     while True:
@@ -212,7 +239,7 @@ def main():
                 if force:
                     print("[TRAINER] FORCE_RUN=1 -> running once now", flush=True)
 
-                # (1) Build tonight's full universe first
+                # (1) Build tonight's universe
                 rebuild_universe_to_s3(_registry)
 
                 # (2) Load symbols for training
