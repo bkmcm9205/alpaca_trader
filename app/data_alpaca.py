@@ -1,93 +1,124 @@
 from __future__ import annotations
-import asyncio, logging, sys
+import os, time
 from datetime import datetime, timedelta, timezone
-from typing import Callable, List, Dict
+from typing import List, Dict, Any, Optional
 
-from .interfaces import Bar
-from .config import Config
-from .logutil import setup_logging
+import requests
+import pandas as pd
 
-# Alpaca data SDK (historical + live)
-try:
-    from alpaca.data.historical import StockHistoricalDataClient
-except Exception:
-    # older/newer layout:
-    from alpaca.data import StockHistoricalDataClient  # type: ignore
+# ---- Config (from env) ----
+ALPACA_DATA_BASE = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets").rstrip("/")
+ALPACA_KEY       = os.getenv("ALPACA_KEY_ID", os.getenv("APCA_API_KEY_ID", ""))
+ALPACA_SECRET    = os.getenv("ALPACA_SECRET_KEY", os.getenv("APCA_API_SECRET_KEY", ""))
+ALPACA_FEED      = os.getenv("ALPACA_DATA_FEED", "sip")  # "sip" on Algo Trader Plus
 
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.data.live import StockDataStream
+def _auth_headers() -> Dict[str, str]:
+    return {
+        "Apca-Api-Key-Id": ALPACA_KEY,
+        "Apca-Api-Secret-Key": ALPACA_SECRET,
+        "accept": "application/json",
+    }
 
-log = logging.getLogger("data_alpaca")
+def _bars_url(symbol: str) -> str:
+    # Single-symbol endpoint; more robust & simpler to paginate
+    return f"{ALPACA_DATA_BASE}/v2/stocks/{symbol}/bars"
 
-def bars_df_to_bar_objects(symbol: str, df) -> List[Bar]:
-    rows = []
-    for idx, r in df.iterrows():
-        rows.append(Bar(
-            symbol=symbol,
-            ts=idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx,
-            open=float(r["open"]),
-            high=float(r["high"]),
-            low=float(r["low"]),
-            close=float(r["close"]),
-            volume=float(r["volume"]),
-        ))
-    return rows
+def _to_df(bars: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not bars:
+        return pd.DataFrame(columns=["open","high","low","close","volume"])
+    # API returns ISO8601 timestamps in "t"
+    idx = pd.to_datetime([b["t"] for b in bars], utc=True)
+    df = pd.DataFrame({
+        "open":   [float(b["o"]) for b in bars],
+        "high":   [float(b["h"]) for b in bars],
+        "low":    [float(b["l"]) for b in bars],
+        "close":  [float(b["c"]) for b in bars],
+        "volume": [int(b["v"])   for b in bars],
+    }, index=idx)
+    # Ensure strictly increasing index (sometimes last partial duplicates)
+    df = df[~df.index.duplicated(keep="last")]
+    df.sort_index(inplace=True)
+    return df
 
-def fetch_historical_bars(cfg: Config, symbols: List[str], start: datetime, end: datetime, timeframe: TimeFrame=TimeFrame.Minute) -> Dict[str, List[Bar]]:
-    client = StockHistoricalDataClient(api_key=cfg.alpaca_key_id, secret_key=cfg.alpaca_secret_key)
-    req = StockBarsRequest(symbols=symbols, timeframe=timeframe, start=start, end=end, feed=cfg.data_feed)
-    out: Dict[str, List[Bar]] = {}
-    data = client.get_stock_bars(req)
-    # alpaca-py returns a dataframe via .df in many versions
-    try:
-        df = data.df
-        for sym in symbols:
-            sdf = df.loc[df.index.get_level_values("symbol") == sym]
-            out[sym] = bars_df_to_bar_objects(sym, sdf.droplevel("symbol"))
-    except Exception:
-        # fallback: iterate dict-of-dfs
-        for sym, sdf in data.items():
-            out[sym] = bars_df_to_bar_objects(sym, sdf)
-    return out
+def fetch_alpaca_1m(symbol: str, limit: int = 1500, end: Optional[datetime] = None) -> pd.DataFrame:
+    """
+    Fetch up to `limit` 1-minute bars for `symbol` from Alpaca, newest-first up to `end` (UTC).
+    Handles pagination via next_page_token. Returns a tz-aware UTC-indexed DataFrame.
+    """
+    if not symbol:
+        return pd.DataFrame()
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        raise RuntimeError("Missing Alpaca credentials (ALPACA_KEY_ID / ALPACA_SECRET_KEY).")
 
-async def run_stream(cfg: Config, symbols: List[str], on_bar: Callable[[Bar], None]):
-    stream = StockDataStream(cfg.alpaca_key_id, cfg.alpaca_secret_key, feed=cfg.data_feed)
-    async def _handler(b):
-        try:
-            bar = Bar(
-                symbol=b.symbol.upper(),
-                ts=b.timestamp if hasattr(b, "timestamp") else datetime.now(timezone.utc),
-                open=float(b.open),
-                high=float(b.high),
-                low=float(b.low),
-                close=float(b.close),
-                volume=float(b.volume),
-            )
-            on_bar(bar)
-        except Exception as e:
-            log.exception(f"[STREAM] handler error: {e}")
+    # We request using a start time so the API can paginate earlier bars deterministically.
+    # Pad start by +20% minutes to be safe vs holidays/halts.
+    end_utc = (end or datetime.utcnow().replace(tzinfo=timezone.utc))
+    pad_min = int(limit * 1.2) + 10
+    start_utc = end_utc - timedelta(minutes=max(limit, 1) + pad_min)
 
-    for sym in symbols:
-        stream.subscribe_bars(_handler, sym)
+    gathered: List[Dict[str, Any]] = []
+    page_token: Optional[str] = None
 
-    log.info(f"[STREAM] subscribing minute bars for {len(symbols)} symbols via {cfg.data_feed.upper()}")
-    await stream.run()
+    remaining = max(limit, 1)
+    tries = 0
 
-# -------- CLI: simple backfill --------
-if __name__ == "__main__":
-    import argparse
-    setup_logging(True)
-    cfg = Config.load_from_env()
+    while remaining > 0 and tries < 50:  # hard safety stop
+        tries += 1
+        chunk = min(10000, remaining)  # API page size
+        params = {
+            "timeframe": "1Min",
+            "start": start_utc.isoformat().replace("+00:00", "Z"),
+            "end": end_utc.isoformat().replace("+00:00", "Z"),
+            "limit": chunk,
+            "feed": ALPACA_FEED,
+        }
+        if page_token:
+            params["page_token"] = page_token
 
-    p = argparse.ArgumentParser()
-    p.add_argument("--symbols", type=str, required=True, help="CSV symbols e.g. AAPL,MSFT,SPY")
-    p.add_argument("--days", type=int, default=5)
-    args = p.parse_args()
+        r = requests.get(_bars_url(symbol), headers=_auth_headers(), params=params, timeout=60)
+        if r.status_code == 429:
+            # Rate limited – backoff and retry
+            time.sleep(0.5)
+            continue
+        r.raise_for_status()
+        data = r.json() or {}
+        bars = data.get("bars", [])
+        if not bars:
+            break
 
-    syms = [s.strip().upper() for s in args.symbols.split(",")]
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=args.days)
-    data = fetch_historical_bars(cfg, syms, start, end)
-    total = sum(len(v) for v in data.values())
-    log.info(f"Fetched {total} bars across {len(data)} symbols from {start} -> {end}")
+        gathered.extend(bars)
+        remaining -= len(bars)
+        page_token = data.get("next_page_token")
+        if not page_token:
+            break
+        # be gentle even on Algo Trader Plus
+        time.sleep(0.05)
+
+    # API returns most-recent-first? Normalize via sort in _to_df
+    df = _to_df(gathered)
+    if len(df) > limit:
+        df = df.iloc[-limit:]  # keep the most recent `limit` rows
+    return df
+
+# Optional convenience for a quick historical backfill (date-range)
+def fetch_alpaca_1m_range(symbol: str, start: datetime, end: datetime | None = None) -> pd.DataFrame:
+    """
+    Fetch 1m bars for a date range [start, end]. Uses repeated calls to fetch_alpaca_1m.
+    """
+    end = end or datetime.utcnow().replace(tzinfo=timezone.utc)
+    out = []
+    cursor = end
+    while cursor > start:
+        df = fetch_alpaca_1m(symbol, limit=10000, end=cursor)
+        if df is None or df.empty:
+            break
+        out.append(df)
+        # step back by len(df) minutes
+        cursor = df.index[0].to_pydatetime()
+        # guard
+        if len(out) > 30:
+            break
+    if not out:
+        return pd.DataFrame()
+    out_df = pd.concat(out).sort_index()
+    return out_df[(out_df.index >= pd.to_datetime(start, utc=True)) & (out_df.index <= pd.to_datetime(end, utc=True))]
