@@ -79,11 +79,11 @@ def rebuild_universe_to_s3(registry: S3ModelRegistry):
         print("[UNIVERSE] S3 not configured; skipping", flush=True)
         return
     try:
-        keep = _list_us_equities()
-        print(f"[UNIVERSE] assets-only -> keep {len(keep)} symbols", flush=True)
-        csv_bytes = ("\n".join(sorted(set(keep))) + "\n").encode("utf-8")
+        keep_syms = _list_us_equities()
+        print(f"[UNIVERSE] assets-only -> keep {len(keep_syms)} symbols", flush=True)
+        csv_bytes = ("\n".join(sorted(set(keep_syms))) + "\n").encode("utf-8")
         registry.s3.put_object(Bucket=S3_BUCKET, Key=UNIVERSE_WRITE_KEY, Body=csv_bytes)
-        print(f"[UNIVERSE] wrote {len(set(keep))} symbols to s3://{S3_BUCKET}/{UNIVERSE_WRITE_KEY}", flush=True)
+        print(f"[UNIVERSE] wrote {len(set(keep_syms))} symbols to s3://{S3_BUCKET}/{UNIVERSE_WRITE_KEY}", flush=True)
     except Exception as e:
         print(f"[UNIVERSE] assets-only error: {e}", flush=True)
 
@@ -92,12 +92,12 @@ def load_universe_from_s3(registry: S3ModelRegistry) -> List[str]:
         return []
     try:
         body = registry.s3.get_object(Bucket=S3_BUCKET, Key=UNIVERSE_WRITE_KEY)["Body"].read().decode("utf-8", errors="ignore")
-        syms = []
+        out = []
         for ln in body.splitlines():
             s = ln.replace("\ufeff", "").strip().upper()
             if s and not s.startswith("#"):
-                syms.append(s)
-        return syms
+                out.append(s)
+        return out
     except ClientError as e:
         print(f"[UNIVERSE] read error: {e}", flush=True)
         return []
@@ -108,8 +108,8 @@ def load_universe_from_s3(registry: S3ModelRegistry) -> List[str]:
 
 _registry = S3ModelRegistry(S3_BUCKET, S3_REGION, S3_BASE_PREFIX)
 
-def _aggregate_bars(symbol: str, tf_min: int, lookback_min: int = 7*24*60) -> pd.DataFrame:
-    df = fetch_alpaca_1m(symbol, limit=lookback_min)
+def _aggregate_bars(sym: str, tf_min: int, lookback_min: int = 7*24*60) -> pd.DataFrame:
+    df = fetch_alpaca_1m(sym, limit=lookback_min)
     if df is None or df.empty:
         return pd.DataFrame()
     if tf_min <= 1:
