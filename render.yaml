@@ -17,9 +17,13 @@ services:
       - key: S3_BUCKET
         sync: false
       - key: S3_REGION
-        value: "us-east-1"
+        value: "us-east-1"   # change to us-east-2 if your bucket is in Ohio
       - key: S3_BASE_PREFIX
         value: "models"
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
       - key: START_EQUITY
         value: "100000"
       - key: DAILY_PROFIT_TARGET_PCT
@@ -79,9 +83,13 @@ services:
       - key: S3_BUCKET
         sync: false
       - key: S3_REGION
-        value: "us-east-1"
+        value: "us-east-1"   # change to us-east-2 if your bucket is in Ohio
       - key: S3_BASE_PREFIX
         value: "models"
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
       - key: SYMBOLS
         value: "SPY,QQQ,AAPL,MSFT,NVDA"
       - key: STRATEGY_NAMES
