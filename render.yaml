@@ -1,12 +1,15 @@
 services:
-  # ===== TRADER – trading_bot =====
+  # ===========================
+  # TRADER – trading_bot ONLY
+  # ===========================
   - type: worker
     name: trader-trading-bot
     env: docker
     plan: starter
     autoDeploy: true
     envVars:
-      - fromGroup: common-secrets
+      - fromGroup: common-secrets       # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+      - fromGroup: alpaca-trading-bot   # ALPACA_KEY_ID / ALPACA_SECRET_KEY (Paper Account A)
 
       # S3 (read-only) + universe file
       - key: S3_BUCKET
@@ -18,13 +21,13 @@ services:
       - key: UNIVERSE_S3_KEY
         value: models/universe/daily.csv
       - key: UNIVERSE_RELOAD_WINDOW_ET
-        value: 08:00-09:25
+        value: "08:00-09:25"
       - key: UNIVERSE_REFRESH_SEC
         value: "60"
 
       # Pre-market model reload
       - key: MODEL_RELOAD_WINDOW_ET
-        value: 08:00-09:25
+        value: "08:00-09:25"
       - key: MODEL_REFRESH_SEC
         value: "60"
 
@@ -32,7 +35,7 @@ services:
       - key: ACTIVE_STRATEGIES
         value: trading_bot
       - key: TF_MIN_LIST
-        value: 1,2,3,5,10
+        value: "1,2,3,5,10"
       - key: RANKED_STRATS
         value: ""
       - key: CONF_THR_DEFAULT
@@ -52,7 +55,7 @@ services:
       - key: POLL_SECONDS
         value: "10"
 
-      # Strategy-internal knobs you used before
+      # Strategy-internal knobs (from your paper setup)
       - key: ALLOWED_EXCHANGES
         value: NYSE,NASDAQ,NASD,XNYS,XNAS
       - key: ALLOW_AFTERHOURS
@@ -90,7 +93,9 @@ services:
       - key: SENTIMENT_SYMBOLS
         value: SPY,QQQ
 
-  # ===== TRADER – ml_merged =====
+  # ===========================
+  # TRADER – ml_merged ONLY
+  # ===========================
   - type: worker
     name: trader-ml-merged
     env: docker
@@ -98,6 +103,7 @@ services:
     autoDeploy: true
     envVars:
       - fromGroup: common-secrets
+      - fromGroup: alpaca-ml-merged     # ALPACA keys for Paper Account B
 
       - key: S3_BUCKET
         value: bkm-alpaca-models-01
@@ -108,19 +114,19 @@ services:
       - key: UNIVERSE_S3_KEY
         value: models/universe/daily.csv
       - key: UNIVERSE_RELOAD_WINDOW_ET
-        value: 08:00-09:25
+        value: "08:00-09:25"
       - key: UNIVERSE_REFRESH_SEC
         value: "60"
 
       - key: MODEL_RELOAD_WINDOW_ET
-        value: 08:00-09:25
+        value: "08:00-09:25"
       - key: MODEL_REFRESH_SEC
         value: "60"
 
       - key: ACTIVE_STRATEGIES
         value: ml_merged
       - key: TF_MIN_LIST
-        value: 1,2,3,5,10
+        value: "1,2,3,5,10"
       - key: RANKED_STRATS
         value: ""
       - key: CONF_THR_DEFAULT
@@ -140,6 +146,7 @@ services:
       - key: POLL_SECONDS
         value: "10"
 
+      # Strategy-internal knobs
       - key: ALLOWED_EXCHANGES
         value: NASD,NASDAQ,NYSE,XNAS,XNYS
       - key: ALLOW_AFTERHOURS
@@ -179,7 +186,9 @@ services:
       - key: ROUND_LOT
         value: "1"
 
-  # ===== TRADER – ranked_ml (ranked) =====
+  # ===========================
+  # TRADER – ranked_ml ONLY (RANKED)
+  # ===========================
   - type: worker
     name: trader-ranked-ml
     env: docker
@@ -187,6 +196,7 @@ services:
     autoDeploy: true
     envVars:
       - fromGroup: common-secrets
+      - fromGroup: alpaca-ranked-ml     # ALPACA keys for Paper Account C
 
       - key: S3_BUCKET
         value: bkm-alpaca-models-01
@@ -197,19 +207,19 @@ services:
       - key: UNIVERSE_S3_KEY
         value: models/universe/daily.csv
       - key: UNIVERSE_RELOAD_WINDOW_ET
-        value: 08:00-09:25
+        value: "08:00-09:25"
       - key: UNIVERSE_REFRESH_SEC
         value: "60"
 
       - key: MODEL_RELOAD_WINDOW_ET
-        value: 08:00-09:25
+        value: "08:00-09:25"
       - key: MODEL_REFRESH_SEC
         value: "60"
 
       - key: ACTIVE_STRATEGIES
         value: ranked_ml
       - key: TF_MIN_LIST
-        value: 1,2,3,5,10
+        value: "1,2,3,5,10"
       - key: RANKED_STRATS
         value: ranked_ml
       - key: TOPK_RANKED_DEFAULT
@@ -231,6 +241,7 @@ services:
       - key: POLL_SECONDS
         value: "10"
 
+      # Strategy-internal knobs
       - key: ALLOW_AFTERHOURS
         value: "0"
       - key: ALLOW_PREMARKET
@@ -262,9 +273,11 @@ services:
       - key: SHORTS_ENABLED
         value: "1"
       - key: TF_MIN_LIST
-        value: 1,2,3,5,10
+        value: "1,2,3,5,10"
 
-  # ===== TRAINER (after-hours) =====
+  # ===========================
+  # TRAINER – after-hours S3 promotion
+  # ===========================
   - type: worker
     name: trainer
     env: docker
@@ -272,7 +285,13 @@ services:
     autoDeploy: true
     envVars:
       - fromGroup: common-secrets
+      - fromGroup: alpaca-trading-bot   # trainer can use any one paper account
 
+      # Role selector for app.launch
+      - key: APP_ROLE
+        value: trainer
+
+      # S3 (read/write)
       - key: S3_BUCKET
         value: bkm-alpaca-models-01
       - key: S3_REGION
@@ -280,11 +299,11 @@ services:
       - key: S3_BASE_PREFIX
         value: models
 
-      # Nightly universe + training window
+      # Training window (ET)
       - key: TRAIN_RUN_START_ET
-        value: 19:00
+        value: "19:00"
       - key: TRAIN_RUN_END_ET
-        value: 20:00
+        value: "20:00"
       - key: TRAINER_SLEEP_SEC
         value: "60"
 
@@ -308,6 +327,6 @@ services:
       - key: TRAIN_SYMBOLS
         value: SPY,QQQ,AAPL,MSFT,NVDA
       - key: TRAIN_TFS
-        value: 5,15
+        value: "5,15"
       - key: TRAIN_METRIC
         value: score
