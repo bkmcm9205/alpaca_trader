@@ -9,6 +9,8 @@ services:
     plan: starter
     # No startCommand for Docker runtime; Dockerfile CMD runs the app.
     envVars:
+      - fromGroup: common-secrets
+      
       # --- Alpaca ---
       - key: ALPACA_KEY_ID
         fromSecret: alpaca-key-id
