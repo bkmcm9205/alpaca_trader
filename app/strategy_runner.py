@@ -72,6 +72,10 @@ def _load_universe(force_boot: bool = False):
     if not (S3_BUCKET and S3_REGION and UNIVERSE_S3_KEY):
         return
 
+    def _clean_sym(s: str) -> str:
+        # strip UTF-8 BOM + whitespace + normalize to UPPER
+        return s.replace("\ufeff", "").strip().upper()
+
     now = time.time()
     if force_boot and not _universe_syms:
         pass
@@ -92,8 +96,14 @@ def _load_universe(force_boot: bool = False):
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
         )
-        body = s3.get_object(Bucket=S3_BUCKET, Key=UNIVERSE_S3_KEY)["Body"].read().decode("utf-8")
-        syms = [ln.strip().upper() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        body = s3.get_object(Bucket=S3_BUCKET, Key=UNIVERSE_S3_KEY)["Body"].read().decode("utf-8", errors="ignore")
+        syms_raw = body.splitlines()
+        syms = []
+        for ln in syms_raw:
+            sym = _clean_sym(ln)
+            if not sym or sym.startswith("#"):
+                continue
+            syms.append(sym)
         if syms:
             _universe_syms = syms
             _universe_loaded_day = datetime.now(ZoneInfo("America/New_York")).date()
