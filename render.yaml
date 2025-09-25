@@ -4,14 +4,14 @@ services:
     env: docker
     plan: starter
     autoDeploy: true
-    startCommand: "python -u -m app.strategy_runner"
+    dockerCommand: "python -u -m app.strategy_runner"
     envVars:
       - key: ALPACA_KEY_ID
         sync: false
       - key: ALPACA_SECRET_KEY
         sync: false
       - key: ALPACA_PAPER
-        value: "true"     # start in paper
+        value: "true"
       - key: ALPACA_DATA_FEED
         value: "sip"
       - key: S3_BUCKET
@@ -40,7 +40,6 @@ services:
         value: "SPY,QQQ,AAPL,MSFT,NVDA"
       - key: STRATEGY_NAMES
         value: "ranked_ml,mean_reversion"
-      # Per-strategy overrides (no code edits)
       - key: S_RANKED_ML_CONF_THR
         value: "0.7"
       - key: S_RANKED_ML_SYMBOLS
@@ -67,7 +66,7 @@ services:
     env: docker
     plan: starter
     autoDeploy: true
-    startCommand: "python -u -m app.trainer_worker"
+    dockerCommand: "python -u -m app.trainer_worker"
     envVars:
       - key: ALPACA_KEY_ID
         sync: false
