@@ -1,76 +1,96 @@
 from __future__ import annotations
-import os, io, json, pickle, time, uuid, logging
+import os, io, json, time, hashlib
+from typing import Optional, Tuple
 import boto3
-from typing import Any, Optional
-
-log = logging.getLogger("model_registry_s3")
+from botocore.exceptions import ClientError
 
 class S3ModelRegistry:
     """
     Layout:
-      s3://{bucket}/{base}/<strategy>/production/model.pkl
-      s3://{bucket}/{base}/<strategy>/production/metrics.json
-      s3://{bucket}/{base}/<strategy>/candidates/<timestamp>/model.pkl
-      s3://{bucket}/{base}/<strategy>/candidates/<timestamp>/metrics.json
+      s3://<bucket>/<base>/models/<strategy>/
+        production/
+          artifact.bin      (your model bytes: pickle, JSON, whatever)
+          meta.json         ({"metric": float, "ts": "...", ...})
+        candidates/<ts>/
+          artifact.bin
+          meta.json
     """
-    def __init__(self, bucket: str, region: str, base_prefix: str):
+    def __init__(self, bucket: str, region: str, base_prefix: str = "models"):
+        if not bucket or not region:
+            raise ValueError("S3ModelRegistry requires S3 bucket and region")
         self.bucket = bucket
-        self.base = base_prefix.strip("/").rstrip("/")
-        self.s3 = boto3.client("s3", region_name=region) if region else boto3.client("s3")
+        self.region = region
+        self.base = base_prefix.strip("/")
 
-    def _key(self, *parts) -> str:
-        return "/".join([p.strip("/") for p in (self.base,)+parts])
+        self.s3 = boto3.client(
+            "s3",
+            region_name=region,
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        )
 
-    def load_production(self, strategy: str) -> Any:
-        key = self._key(strategy, "production", "model.pkl")
-        log.info(f"[S3] downloading production model: s3://{self.bucket}/{key}")
-        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        return pickle.loads(obj["Body"].read())
+    def _pfx(self, strategy: str) -> str:
+        return f"{self.base}/{strategy}"
 
-    def load_production_metrics(self, strategy: str) -> Optional[dict]:
-        key = self._key(strategy, "production", "metrics.json")
+    def _prod_keys(self, strategy: str) -> Tuple[str, str]:
+        pfx = self._pfx(strategy)
+        return f"{pfx}/production/artifact.bin", f"{pfx}/production/meta.json"
+
+    def _cand_keys(self, strategy: str, ts: str) -> Tuple[str, str]:
+        pfx = self._pfx(strategy)
+        return f"{pfx}/candidates/{ts}/artifact.bin", f"{pfx}/candidates/{ts}/meta.json"
+
+    # ------------ LOAD ------------
+    def load_production(self, strategy: str) -> Tuple[bytes, dict, str]:
+        """Returns (artifact_bytes, meta_dict, version_tag)."""
+        art_key, meta_key = self._prod_keys(strategy)
         try:
-            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-            return json.loads(obj["Body"].read().decode())
-        except self.s3.exceptions.NoSuchKey:
-            return None
-        except Exception:
-            return None
+            meta_obj = self.s3.get_object(Bucket=self.bucket, Key=meta_key)
+            art_obj = self.s3.get_object(Bucket=self.bucket, Key=art_key)
+        except ClientError as e:
+            raise FileNotFoundError(f"No production model for {strategy}: {e}")
 
-    def save_candidate(self, strategy: str, model_obj: Any, metrics: dict) -> str:
-        ts = int(time.time())
-        cand_prefix = self._key(strategy, "candidates", str(ts))
-        mpkl = pickle.dumps(model_obj)
-        self.s3.put_object(Bucket=self.bucket, Key=f"{cand_prefix}/model.pkl", Body=mpkl)
-        self.s3.put_object(Bucket=self.bucket, Key=f"{cand_prefix}/metrics.json",
-                           Body=json.dumps(metrics).encode(), ContentType="application/json")
-        log.info(f"[S3] saved candidate at s3://{self.bucket}/{cand_prefix}")
-        return f"{cand_prefix}"
+        meta = json.loads(meta_obj["Body"].read().decode("utf-8"))
+        art_bytes = art_obj["Body"].read()
+        # version tag = sha256 of artifact for quick change detection
+        vtag = hashlib.sha256(art_bytes).hexdigest()
+        return art_bytes, meta, vtag
 
-    def promote(self, strategy: str, candidate_prefix: str):
-        # copy candidate -> production
-        src_model = f"{candidate_prefix}/model.pkl"
-        src_metrics = f"{candidate_prefix}/metrics.json"
-        dst_model = self._key(strategy, "production", "model.pkl")
-        dst_metrics = self._key(strategy, "production", "metrics.json")
+    # ------------ SAVE CANDIDATE ------------
+    def save_candidate(self, strategy: str, artifact: bytes, meta: dict) -> str:
+        ts = meta.get("ts") or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        art_key, meta_key = self._cand_keys(strategy, ts)
+        self.s3.put_object(Bucket=self.bucket, Key=art_key, Body=artifact)
+        self.s3.put_object(Bucket=self.bucket, Key=meta_key, Body=json.dumps(meta).encode("utf-8"))
+        return ts  # candidate id
 
-        self.s3.copy_object(Bucket=self.bucket, CopySource={"Bucket": self.bucket, "Key": src_model}, Key=dst_model)
-        self.s3.copy_object(Bucket=self.bucket, CopySource={"Bucket": self.bucket, "Key": src_metrics}, Key=dst_metrics)
-        log.info(f"[S3] promoted candidate -> production for {strategy}")
+    # ------------ PROMOTE ------------
+    def promote_candidate(self, strategy: str, candidate_ts: str):
+        src_art, src_meta = self._cand_keys(strategy, candidate_ts)
+        dst_art, dst_meta = self._prod_keys(strategy)
+        # Copy over candidate -> production
+        self.s3.copy_object(Bucket=self.bucket, CopySource={"Bucket": self.bucket, "Key": src_art}, Key=dst_art)
+        self.s3.copy_object(Bucket=self.bucket, CopySource={"Bucket": self.bucket, "Key": src_meta}, Key=dst_meta)
 
-    def maybe_promote_if_better(self, strategy: str, candidate_prefix: str, metric_name: str="val_sharpe"):
-        # Compare one scalar metric (higher is better)
-        prod = self.load_production_metrics(strategy) or {}
+    # ------------ HELPER: compare & promote ------------
+    def compare_and_maybe_promote(self, strategy: str, candidate_ts: str, higher_is_better: bool = True) -> bool:
+        """Compares candidate metric to production; promotes if better or if no production exists."""
+        _, cand_meta = self._get_candidate(strategy, candidate_ts)
+        c = float(cand_meta.get("metric", float("nan")))
+
         try:
-            prod_val = float(prod.get(metric_name, float("-inf")))
-        except Exception:
-            prod_val = float("-inf")
+            _, prod_meta, _ = self.load_production(strategy)
+            p = float(prod_meta.get("metric", float("nan")))
+            is_better = (c > p) if higher_is_better else (c < p)
+        except FileNotFoundError:
+            is_better = True  # no production yet
 
-        obj = self.s3.get_object(Bucket=self.bucket, Key=f"{candidate_prefix}/metrics.json")
-        cand = json.loads(obj["Body"].read().decode())
-        cand_val = float(cand.get(metric_name, float("-inf")))
+        if is_better:
+            self.promote_candidate(strategy, candidate_ts)
+        return is_better
 
-        if cand_val > prod_val:
-            self.promote(strategy, candidate_prefix)
-            return True, cand_val, prod_val
-        return False, cand_val, prod_val
+    def _get_candidate(self, strategy: str, ts: str) -> Tuple[bytes, dict]:
+        art_key, meta_key = self._cand_keys(strategy, ts)
+        meta_obj = self.s3.get_object(Bucket=self.bucket, Key=meta_key)
+        art_obj = self.s3.get_object(Bucket=self.bucket, Key=art_key)
+        return art_obj["Body"].read(), json.loads(meta_obj["Body"].read().decode("utf-8"))
