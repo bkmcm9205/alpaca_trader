@@ -1,83 +1,56 @@
+# app/strategies/ranked_ml_adapter.py
 from __future__ import annotations
-import os, time, json, pickle
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import os
+from typing import Optional, Dict, Any
+
 import pandas as pd
 
-from app.model_registry_s3 import S3ModelRegistry
-from app.strategies.ranked_ml import compute_signal as _compute  # type: ignore
+from app.strategies.model_runtime import (
+    maybe_load_model, resample_tf, latest_features, proba_up_for
+)
 
-NAME = "ranked_ml"
+STRAT = "ranked_ml"
 
-_S3_BUCKET = os.getenv("S3_BUCKET", "")
-_S3_REGION = os.getenv("S3_REGION", "")
-_S3_PREFIX = os.getenv("S3_BASE_PREFIX", "models")
-_registry = S3ModelRegistry(_S3_BUCKET, _S3_REGION, _S3_PREFIX) if _S3_BUCKET and _S3_REGION else None
+# IMPORTANT: The *ranking/top-K behavior* is preserved by your runner (RANKED_STRATS env).
+# This adapter just emits a confidence score; runner does the ranking and selection.
+CONF_THR = float(os.getenv("CONF_THR_RANKED_ML", os.getenv("CONF_THR", "0.80")))
+R_MULT   = float(os.getenv("R_MULT_RANKED_ML",   os.getenv("R_MULT", "3.0")))
+SHORTS_ENABLED = os.getenv("SHORTS_ENABLED", "1").lower() in ("1","true","yes")
 
-_MODEL_RELOAD_WINDOW = os.getenv("MODEL_RELOAD_WINDOW_ET", "08:00-09:25")
-_REFRESH_SEC = int(os.getenv("MODEL_REFRESH_SEC", "60"))
-
-_model_blob, _model_meta, _vtag, _last_check, _loaded_day = None, {}, "", 0.0, None
-
-def _deserialize(b: bytes):
-    try:
-        return pickle.loads(b)
-    except Exception:
-        try:
-            return json.loads(b.decode("utf-8"))
-        except Exception:
-            return b
-
-def _in_reload_window_et() -> bool:
-    try:
-        start_s, end_s = _MODEL_RELOAD_WINDOW.split("-", 1)
-        now_hm = datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M")
-        return start_s <= now_hm <= end_s
-    except Exception:
-        return False
-
-def _maybe_load(force_boot: bool = False):
-    global _model_blob, _model_meta, _vtag, _last_check, _loaded_day
-    if not _registry:
-        return
-    now = time.time()
-    if force_boot and not _vtag:
-        pass
-    else:
-        if (now - _last_check) < _REFRESH_SEC:
-            return
-        _last_check = now
-        if not _in_reload_window_et():
-            return
-        today = datetime.now(ZoneInfo("America/New_York")).date()
-        if _loaded_day == today:
-            return
-    try:
-        art, meta, vtag = _registry.load_production(NAME)
-        if vtag != _vtag:
-            _model_blob, _model_meta, _vtag = _deserialize(art), meta, vtag
-            _loaded_day = datetime.now(ZoneInfo("America/New_York")).date()
-            print(f"[{NAME}] loaded production model vtag={_vtag[:8]} metric={meta.get('metric')}", flush=True)
-        else:
-            _loaded_day = datetime.now(ZoneInfo("America/New_York")).date()
-    except Exception:
-        pass
-
-def decide(symbol: str, df1m: pd.DataFrame, tf_minutes: int) -> dict | None:
-    _maybe_load(force_boot=True)
-    try:
-        sig = _compute("ml_pattern", symbol, tf_minutes, sentiment="neutral", df1m=df1m, model=_model_blob)
-    except TypeError:
-        sig = _compute("ml_pattern", symbol, tf_minutes, sentiment="neutral", df1m=df1m)
-    if not sig:
-        return None
-    action = (sig.get("action") or "").lower()
-    side = "sell" if action in ("sell", "sell_short", "short") else "buy"
+def _build_payload(side: str, last: float, proba_up: float) -> Dict[str, Any]:
+    sl_pct = 0.01
+    tp_pct = 0.01 * R_MULT
     return {
         "side": side,
-        "confidence": float(sig.get("confidence", sig.get("score", 0.0) or 0.0)),
-        "quantity": int(sig.get("quantity", 0) or 0),
-        "takeProfit": sig.get("takeProfit"),
-        "stopLoss": sig.get("stopLoss"),
-        "meta": {"src": NAME, **(sig.get("meta") or {}), **({"model_metric": _model_meta.get("metric")} if _model_meta else {})},
+        "quantity": None,
+        "takeProfit": tp_pct,
+        "stopLoss": sl_pct,
+        "confidence": float(proba_up if side == "buy" else (1.0 - proba_up)),
     }
+
+def decide(symbol: str, df1m: pd.DataFrame, tf_min: int) -> Optional[Dict[str, Any]]:
+    model = maybe_load_model(STRAT)
+
+    bars = resample_tf(df1m, tf_min)
+    x_live, last = latest_features(bars)
+    if x_live is None or last is None:
+        return None
+
+    p_up = proba_up_for(model, x_live)
+    if p_up is None:
+        return None
+
+    want_long  = p_up >= CONF_THR
+    want_short = (1.0 - p_up) >= CONF_THR and SHORTS_ENABLED
+
+    if want_long:
+        return _build_payload("buy", last, p_up)
+    if want_short:
+        return _build_payload("sell", last, p_up)
+
+    # For ranked_ml, even if we don't cross CONF_THR, you may choose to emit a weak signal
+    # with low confidence so it can still be considered in ranking. If you want that,
+    # uncomment the next two lines:
+    # return {"side": "buy" if p_up >= 0.5 else "sell", "quantity": None,
+    #         "takeProfit": 0.01*R_MULT, "stopLoss": 0.01, "confidence": float(max(p_up, 1.0-p_up))}
+    return None
