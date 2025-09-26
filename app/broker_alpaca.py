@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os, time
 from collections import deque
-from typing import Dict, Tuple, Set, Any
+from typing import Dict, Tuple, Set, Any, Optional
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 
 import requests
@@ -11,22 +11,16 @@ ALPACA_TRADING_BASE = os.getenv("ALPACA_TRADING_BASE", "https://paper-api.alpaca
 ALPACA_KEY          = os.getenv("ALPACA_KEY_ID", os.getenv("APCA_API_KEY_ID", ""))
 ALPACA_SECRET       = os.getenv("ALPACA_SECRET_KEY", os.getenv("APCA_API_SECRET_KEY", ""))
 
-# Per-minute order rate limit (simple in-process limiter)
 ORDER_RATE_LIMIT_PM = int(os.getenv("ORDER_RATE_LIMIT_PM", "120"))
-
-# Optional per-strategy tag for traceability
-STRAT_TAG = os.getenv("STRAT_TAG", "").strip()  # e.g., TB / MM / RML
-
-# Optional sizing helper if a signal gives qty 0
-USD_PER_TRADE = float(os.getenv("USD_PER_TRADE", "0") or 0.0)
+STRAT_TAG           = os.getenv("STRAT_TAG", "").strip()  # e.g., TB/MM/RML
+USD_PER_TRADE       = float(os.getenv("USD_PER_TRADE", "0") or 0.0)
 
 # Tick sizes (overridable)
-TICK_ABOVE_1  = os.getenv("TICK_ABOVE_1",  "0.01")
-TICK_BELOW_1  = os.getenv("TICK_BELOW_1",  "0.0001")
+TICK_ABOVE_1 = os.getenv("TICK_ABOVE_1", "0.01")
+TICK_BELOW_1 = os.getenv("TICK_BELOW_1", "0.0001")
 
-getcontext().prec = 12  # sufficient precision for equity ticks
+getcontext().prec = 12
 
-# ====== Internal helpers ======
 def _auth_headers() -> Dict[str, str]:
     if not ALPACA_KEY or not ALPACA_SECRET:
         raise RuntimeError("Missing Alpaca credentials (ALPACA_KEY_ID / ALPACA_SECRET_KEY).")
@@ -37,131 +31,141 @@ def _auth_headers() -> Dict[str, str]:
         "content-type": "application/json",
     }
 
-def _orders_url() -> str:
-    return f"{ALPACA_TRADING_BASE}/v2/orders"
+def _orders_url() -> str:     return f"{ALPACA_TRADING_BASE}/v2/orders"
+def _positions_url() -> str:  return f"{ALPACA_TRADING_BASE}/v2/positions"
+def _position_url(sym:str)->str: return f"{ALPACA_TRADING_BASE}/v2/positions/{sym.upper()}"
+def _account_url() -> str:    return f"{ALPACA_TRADING_BASE}/v2/account"
+def _asset_url(sym:str)->str: return f"{ALPACA_TRADING_BASE}/v2/assets/{sym.upper()}"
 
-def _positions_url() -> str:
-    return f"{ALPACA_TRADING_BASE}/v2/positions"
+def _dec(x): return Decimal(str(x))
 
-def _account_url() -> str:
-    return f"{ALPACA_TRADING_BASE}/v2/account"
+def _snap_to_tick(price: Optional[float]) -> Optional[float]:
+    if price is None: return None
+    d = _dec(price)
+    tick = _dec(TICK_ABOVE_1) if d >= _dec("1.0") else _dec(TICK_BELOW_1)
+    return float((d / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick)
 
-def _decimal(x: float | str) -> Decimal:
-    return Decimal(str(x))
+def _tp_from(last: float, tp: Optional[float], is_long: bool) -> Optional[float]:
+    if tp is None: return None
+    v = float(tp)
+    raw = (last * (1.0 + v)) if (0 < v < 1 and is_long) else \
+          (last * (1.0 - v)) if (0 < v < 1 and not is_long) else v
+    return _snap_to_tick(raw)
 
-def _snap_to_equity_tick(price: float | None) -> float | None:
-    """
-    Snap to the appropriate equity tick:
-      - >= $1.00 -> $0.01
-      -  < $1.00 -> $0.0001
-    Overridable via TICK_ABOVE_1 / TICK_BELOW_1.
-    """
-    if price is None:
-        return None
-    d = _decimal(price)
-    tick = _decimal(TICK_ABOVE_1) if d >= _decimal("1.0") else _decimal(TICK_BELOW_1)
-    snapped = (d / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
-    return float(snapped)
+def _sl_from(last: float, sl: Optional[float], is_long: bool) -> Optional[float]:
+    if sl is None: return None
+    v = float(sl)
+    raw = (last * (1.0 - v)) if (0 < v < 1 and is_long) else \
+          (last * (1.0 + v)) if (0 < v < 1 and not is_long) else v
+    return _snap_to_tick(raw)
 
-def _normalize_price_from_pct_or_abs(last: float, val: float | None, upward: bool) -> float | None:
-    """
-    Interpret TP/SL values:
-      - None -> None
-      - 0 < val < 1 -> treat as % offset from `last` (upward=True for TP, False for SL)
-      - val >= 1 -> treat as absolute price
-    Always returns a tick-snapped float or None.
-    """
-    if val is None:
-        return None
+def _tick_size_for(last: float) -> Decimal:
+    return _dec(TICK_ABOVE_1) if _dec(last) >= _dec("1.0") else _dec(TICK_BELOW_1)
+
+def _positions_map() -> Dict[str, Dict[str, Any]]:
     try:
-        v = float(val)
-    except Exception:
-        return None
-    if v <= 0:
-        return None
-    raw = (last * (1.0 + v)) if (v < 1.0 and upward) else \
-          (last * (1.0 - v)) if (v < 1.0 and not upward) else \
-          v
-    return _snap_to_equity_tick(raw)
+        r = requests.get(_positions_url(), headers=_auth_headers(), timeout=20)
+        if r.status_code == 404: return {}
+        r.raise_for_status()
+        out = {}
+        for p in r.json() or []:
+            sym = str(p.get("symbol","")).upper()
+            out[sym] = p
+        return out
+    except requests.RequestException:
+        return {}
 
-# tiny token bucket to avoid burst rate errors
-_order_bucket: deque[float] = deque()
+def _asset(sym: str) -> Dict[str, Any]:
+    r = requests.get(_asset_url(sym), headers=_auth_headers(), timeout=15)
+    r.raise_for_status()
+    return r.json()
 
-def _rate_limit_block():
-    now = time.time()
-    while _order_bucket and now - _order_bucket[0] > 60.0:
-        _order_bucket.popleft()
-    if len(_order_bucket) >= ORDER_RATE_LIMIT_PM:
-        sleep_for = 60.0 - (now - _order_bucket[0])
-        time.sleep(max(0.05, sleep_for))
-    _order_bucket.append(time.time())
-
-# ====== Public API used by strategy_runner ======
 def get_account_summary() -> Dict[str, Any]:
     r = requests.get(_account_url(), headers=_auth_headers(), timeout=30)
     r.raise_for_status()
     return r.json()
 
 def get_positions_symbols() -> Set[str]:
-    """
-    Returns symbols with an open position.
-    """
-    try:
-        r = requests.get(_positions_url(), headers=_auth_headers(), timeout=30)
-        if r.status_code == 404:
-            return set()
-        r.raise_for_status()
-        arr = r.json() or []
-        return {str(p.get("symbol", "")).upper() for p in arr if p.get("symbol")}
-    except requests.RequestException:
-        return set()
+    return set(_positions_map().keys())
+
+_order_bucket: deque[float] = deque()
+def _rate_limit_block():
+    now = time.time()
+    while _order_bucket and now - _order_bucket[0] > 60.0: _order_bucket.popleft()
+    if len(_order_bucket) >= ORDER_RATE_LIMIT_PM:
+        time.sleep(max(0.05, 60.0 - (now - _order_bucket[0])))
+    _order_bucket.append(time.time())
 
 def place_bracket_order(
     symbol: str,
     side: str,                # "buy" or "sell"
     qty: int,
     last_price: float,
-    tp: float | None,         # percent (0-1) or absolute price
-    sl: float | None          # percent (0-1) or absolute price
+    tp: float | None,
+    sl: float | None
 ) -> Tuple[bool, Dict[str, Any] | str]:
-    """
-    Places a MARKET parent order. If tp/sl provided, attaches Alpaca 'bracket' children:
-      - take_profit.limit_price (tick-snapped)
-      - stop_loss.stop_price    (tick-snapped)
-    Returns (ok, info) where ok=True if 2xx and info is JSON; else ok=False with error text.
-    """
     if not symbol or not side:
         return False, "missing symbol or side"
-
     side = side.lower().strip()
-    if side not in ("buy", "sell"):
+    if side not in ("buy","sell"):
         return False, f"invalid side '{side}'"
-
-    # Fallback sizing: if qty <= 0 and USD_PER_TRADE is set, derive qty from last_price
     if (qty or 0) <= 0 and USD_PER_TRADE > 0 and last_price > 0:
         qty = max(1, int(USD_PER_TRADE / float(last_price)))
-
     if (qty or 0) <= 0:
         return False, "qty must be > 0"
 
-    # Compute tick-snapped TP/SL
-    tp_price = _normalize_price_from_pct_or_abs(last_price, tp, upward=True)
-    sl_price = _normalize_price_from_pct_or_abs(last_price, sl, upward=False)
+    # --- Preflight asset & shortability
+    try:
+        a = _asset(symbol)
+        if not a.get("tradable", False):
+            return False, "403 asset not tradable"
+    except requests.RequestException as e:
+        return False, f"asset lookup failed: {e}"
 
-    # Build MARKET parent
+    # Are we opening a short? (SELL with no long position → short)
+    pos = _positions_map().get(symbol.upper())
+    has_long = False
+    if pos:
+        try:
+            qty_long = float(pos.get("qty", "0"))
+            side_pos = pos.get("side","").lower()  # "long" or "short"
+            has_long = side_pos == "long" and qty_long > 0
+        except Exception:
+            has_long = False
+
+    is_short_open = (side == "sell" and not has_long)
+    if is_short_open and not a.get("shortable", False):
+        return False, "403 shorting not allowed (shortable=false)"
+
+    is_long = (side == "buy")
+    tp_price = _tp_from(last_price, tp, is_long)
+    sl_price = _sl_from(last_price, sl, is_long)
+
+    # --- Bracket sanity / nudge onto correct side of price
+    tick = float(_tick_size_for(last_price))
+    if is_long:
+        if tp_price is not None and tp_price <= last_price:
+            tp_price = _snap_to_tick(last_price + tick)
+        if sl_price is not None and sl_price >= last_price:
+            sl_price = _snap_to_tick(last_price - tick)
+    else:  # short
+        if tp_price is not None and tp_price >= last_price:
+            tp_price = _snap_to_tick(last_price - tick)
+        if sl_price is not None and sl_price <= last_price:
+            sl_price = _snap_to_tick(last_price + tick)
+
+    # Parent MARKET + bracket children (if any)
     tag = STRAT_TAG or "STRAT"
     client_order_id = f"{tag}-{symbol}-{int(time.time())}"
     data: Dict[str, Any] = {
         "symbol": symbol.upper(),
         "side": side,
-        "type": "market",      # parent is always market
+        "type": "market",
         "time_in_force": "day",
         "qty": int(qty),
         "client_order_id": client_order_id,
     }
-
-    # Attach bracket children only if we have at least one valid price
-    if (tp_price is not None) or (sl_price is not None):
+    if tp_price is not None or sl_price is not None:
         data["order_class"] = "bracket"
         if tp_price is not None:
             data["take_profit"] = {"limit_price": float(tp_price)}
@@ -177,7 +181,8 @@ def place_bracket_order(
                 body = r.json()
             except Exception:
                 body = r.text
-            return False, f"{r.status_code} {body}"
+            # Print full payload + server response to diagnose 403/422 precisely
+            return False, {"status": r.status_code, "body": body, "payload": data}
         return True, r.json()
     except requests.RequestException as e:
         return False, str(e)
