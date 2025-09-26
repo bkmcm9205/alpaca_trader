@@ -1,40 +1,41 @@
 # app/strategies/model_runtime.py
 from __future__ import annotations
-import os, pickle
+import os, pickle, io
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import boto3
 import pandas as pd
 import numpy as np
 
+from app.model_registry_s3 import S3ModelRegistry
+
 ET = ZoneInfo("America/New_York")
 
-# -----------------------------
-# S3 + Pre-market model loader
-# -----------------------------
+# ---------------------------------
+# S3-based pre-market model loader
+# ---------------------------------
 
 @dataclass
 class ModelCache:
     obj: Optional[object] = None
     loaded_day: Optional[datetime.date] = None
-    path: str = ""
+    vtag: str = ""
+    meta: Dict = None
 
 _model_caches: Dict[str, ModelCache] = {}
 
-def _s3():
-    return boto3.client(
-        "s3",
-        region_name=os.getenv("S3_REGION", "us-east-2"),
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    )
+# one registry for all strategies
+_registry = S3ModelRegistry(
+    bucket=os.getenv("S3_BUCKET", ""),
+    region=os.getenv("S3_REGION", "us-east-2"),
+    base_prefix=os.getenv("S3_BASE_PREFIX", "models"),
+)
 
 def _in_window(window: str) -> bool:
     """
-    Inclusive HH:MM-HH:MM in ET. If parse fails, be permissive (True).
+    Inclusive HH:MM-HH:MM in ET.  If parse fails, be permissive (True).
     """
     try:
         s, e = window.split("-", 1)
@@ -43,23 +44,14 @@ def _in_window(window: str) -> bool:
     except Exception:
         return True
 
-def _model_dir_for(strategy_name: str) -> str:
-    """
-    Reads per-strategy env like MODEL_DIR_TRADING_BOT, fallback to models/<strat>/prod
-    """
-    key = f"MODEL_DIR_{strategy_name.upper()}"
-    default = f"models/{strategy_name}/prod"
-    return os.getenv(key, default)
-
 def maybe_load_model(strategy_name: str) -> Optional[object]:
     """
-    Load models/<strategy>/prod/model.pkl ONLY during MODEL_RELOAD_WINDOW_ET,
-    at most once per ET day. Returns the unpickled object or None.
+    Load models/<strategy>/production/artifact.bin **only during MODEL_RELOAD_WINDOW_ET**,
+    at most once per ET day.  Returns the un-pickled object or None.
     """
-    global _model_caches
     window = os.getenv("MODEL_RELOAD_WINDOW_ET", "08:00-09:25")
     if not _in_window(window):
-        # Outside the reload window — keep current model in memory
+        # outside reload window → keep current in-memory copy
         return _model_caches.get(strategy_name, ModelCache()).obj
 
     today = datetime.now(ET).date()
@@ -67,27 +59,29 @@ def maybe_load_model(strategy_name: str) -> Optional[object]:
     if cache and cache.obj is not None and cache.loaded_day == today:
         return cache.obj
 
-    bucket = os.getenv("S3_BUCKET", "")
-    if not bucket:
-        return cache.obj if cache else None
-
-    model_dir = _model_dir_for(strategy_name)
-    key = f"{model_dir.rstrip('/')}/model.pkl"
-
+    # try loading from registry
     try:
-        body = _s3().get_object(Bucket=bucket, Key=key)["Body"].read()
-        obj = pickle.loads(body)
-        _model_caches[strategy_name] = ModelCache(obj=obj, loaded_day=today, path=f"s3://{bucket}/{key}")
-        print(f"[MODEL:{strategy_name}] loaded {_model_caches[strategy_name].path}", flush=True)
-        return obj
+        art, meta, vtag = _registry.load_production(strategy_name)
+        model = pickle.load(io.BytesIO(art))
+        _model_caches[strategy_name] = ModelCache(
+            obj=model, loaded_day=today, vtag=vtag, meta=meta
+        )
+        print(
+            f"[MODEL:{strategy_name}] loaded from S3 "
+            f"metric={meta.get('metric')} vtag={vtag[:8]}…",
+            flush=True,
+        )
+        return model
+    except FileNotFoundError as e:
+        print(f"[MODEL:{strategy_name}] no production artifact in S3 → {e}", flush=True)
+        return None
     except Exception as e:
-        print(f"[MODEL:{strategy_name}] load failed ({key}): {e}", flush=True)
-        # Keep whatever we had
-        return cache.obj if cache else None
+        print(f"[MODEL:{strategy_name}] failed to load/deserialize → {e}", flush=True)
+        return None
 
-# -----------------------------
+# ---------------------------------
 # Feature pipeline (match trainer)
-# -----------------------------
+# ---------------------------------
 
 def resample_tf(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
     if df1m is None or df1m.empty or "close" not in df1m.columns:
@@ -95,7 +89,7 @@ def resample_tf(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
     if tf_min <= 1:
         return df1m.copy()
     rule = f"{int(tf_min)}min"
-    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     try:
         bars = df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
     except Exception:
@@ -105,7 +99,7 @@ def resample_tf(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
 def latest_features(bars: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[float]]:
     """
     Returns (X_live, last_price) where X_live is a 1-row DataFrame
-    with columns ["return","rsi","volatility"] aligned to trainer.
+    with columns [return, rsi, volatility] aligned to trainer.
     """
     if bars is None or bars.empty or "close" not in bars.columns:
         return None, None
@@ -125,18 +119,18 @@ def latest_features(bars: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optiona
     if df.empty:
         return None, None
 
-    x = df[["return","rsi","volatility"]].iloc[[-1]]
+    x = df[["return", "rsi", "volatility"]].iloc[[-1]]
     last = float(df["close"].iloc[-1])
     return x, last
 
-# -----------------------------
+# ---------------------------------
 # Inference wrapper
-# -----------------------------
+# ---------------------------------
 
 def proba_up_for(model_obj: object, x_live: pd.DataFrame) -> Optional[float]:
     """
-    Works with the trainer’s artifact: either {"clf": RF, "features":[...]}
-    or a trivial {"clf": None, "prior": 0.5}.
+    Works with trainer’s artifact: either {"clf": RF, "features":[...]}
+    or trivial {"clf": None, "prior": 0.5}.
     """
     if model_obj is None:
         return None
@@ -146,13 +140,12 @@ def proba_up_for(model_obj: object, x_live: pd.DataFrame) -> Optional[float]:
             # trivial prior model
             return float(model_obj.get("prior", 0.5))
         # align features if provided
-        feats = model_obj.get("features", ["return","rsi","volatility"])
+        feats = model_obj.get("features", ["return", "rsi", "volatility"])
         x = x_live
         try:
             x = x_live[feats]
         except Exception:
             pass
-        p = float(clf.predict_proba(x)[0][1])
-        return p
+        return float(clf.predict_proba(x)[0][1])
     except Exception:
         return None
