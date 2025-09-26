@@ -23,37 +23,34 @@ from app.strategy_registry import ADAPTERS
 #         ENV / CONFIG
 # =============================
 
-# S3-driven symbol universe (loaded pre-market only; otherwise static all day)
 S3_BUCKET = os.getenv("S3_BUCKET","")
 S3_REGION = os.getenv("S3_REGION","")
-UNIVERSE_S3_KEY = os.getenv("UNIVERSE_S3_KEY","")  # e.g., models/universe/daily.csv
+UNIVERSE_S3_KEY = os.getenv("UNIVERSE_S3_KEY","")
 UNIVERSE_RELOAD_WINDOW_ET = os.getenv("UNIVERSE_RELOAD_WINDOW_ET","08:00-09:25")
 UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC","60"))
 
-# Scan/timeframe config
 SYMBOLS = [s.strip().upper() for s in os.getenv("SCANNER_SYMBOLS","").split(",") if s.strip()]
 TF_MIN_LIST = [int(x) for x in os.getenv("TF_MIN_LIST","5,15").split(",") if x.strip()]
 
 ACTIVE = [s.strip() for s in os.getenv("ACTIVE_STRATEGIES","trading_bot,ml_merged,ranked_ml").split(",") if s.strip()]
 
-LOOKBACK_MIN = int(os.getenv("LOOKBACK_MIN","2400"))     # ~40h of 1m bars
+LOOKBACK_MIN = int(os.getenv("LOOKBACK_MIN","2400"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS","20"))
 
 DRY_RUN = os.getenv("DRY_RUN","1") in ("1","true","True")
 DEDUP_BY_SYMBOL = os.getenv("DEDUP_BY_SYMBOL","1") in ("1","true","True")
 SKIP_IF_POSITION_OPEN = os.getenv("SKIP_IF_POSITION_OPEN","1") in ("1","true","True")
 
-# Ranking applies only to these strategies (your core: ranked_ml)
 RANKED_STRATS = [s.strip() for s in os.getenv("RANKED_STRATS","ranked_ml").split(",") if s.strip()]
-TOPK_RANKED_DEFAULT = int(os.getenv("TOPK_RANKED_DEFAULT","1"))       # take top-K for ranked strats
+TOPK_RANKED_DEFAULT = int(os.getenv("TOPK_RANKED_DEFAULT","1"))
 CONF_THR_DEFAULT = float(os.getenv("CONF_THR_DEFAULT","0.05"))
 MIN_QTY_DEFAULT = int(os.getenv("MIN_QTY_DEFAULT","1"))
-_NONRANK_BIG = 10**9  # effectively "no cap" for non-ranked unless TOPK_<STRAT> set
+_NONRANK_BIG = 10**9
 
 # --- NEW: Buying power & RTH guards ---
-BP_RESERVE_PCT = float(os.getenv("BP_RESERVE_PCT", "0.10"))          # keep 10% buffer
+BP_RESERVE_PCT = float(os.getenv("BP_RESERVE_PCT", "0.10"))
 MIN_NOTIONAL_PER_ORDER = float(os.getenv("MIN_NOTIONAL_PER_ORDER", "50"))
-REQUIRE_RTH = os.getenv("REQUIRE_RTH", "0") in ("1","true","True")   # optional: block entries outside 9:30–16:00 ET
+REQUIRE_RTH = os.getenv("REQUIRE_RTH", "0") in ("1","true","True")
 
 def _per_strat(key: str, strat: str, cast, default):
     env_key = f"{key}_{strat.upper()}"
@@ -77,14 +74,12 @@ def _in_window(window: str) -> bool:
         return False
 
 def _load_universe(force_boot: bool = False):
-    """Load newline-delimited symbols from S3 once per day (pre-market window only)."""
     global _universe_syms, _universe_loaded_day, _universe_last_check
     if not (S3_BUCKET and S3_REGION and UNIVERSE_S3_KEY):
         return
 
     def _clean_sym(s: str) -> str:
-        # strip UTF-8 BOM + whitespace + normalize to UPPER
-        return s.replace("\ufeff", "").strip().upper()
+        return s.replace("\ufeff","").strip().upper()
 
     now = time.time()
     if force_boot and not _universe_syms:
@@ -106,14 +101,9 @@ def _load_universe(force_boot: bool = False):
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
         )
-        body = s3.get_object(Bucket=S3_BUCKET, Key=UNIVERSE_S3_KEY)["Body"].read().decode("utf-8", errors="ignore")
-        syms_raw = body.splitlines()
-        syms = []
-        for ln in syms_raw:
-            sym = _clean_sym(ln)
-            if not sym or sym.startswith("#"):
-                continue
-            syms.append(sym)
+        body = s3.get_object(Bucket=S3_BUCKET, Key=UNIVERSE_S3_KEY)["Body"].read().decode("utf-8","ignore")
+        syms = [ln.replace("\ufeff","").strip().upper()
+                for ln in body.splitlines() if ln.strip() and not ln.startswith("#")]
         if syms:
             _universe_syms = syms
             _universe_loaded_day = datetime.now(ZoneInfo("America/New_York")).date()
@@ -133,18 +123,18 @@ class Candidate:
     confidence: float
     side: str
     qty: int
-    tp: float | None
-    sl: float | None
+    tp: float|None
+    sl: float|None
     last: float
 
 def _load_adapters():
     mods = {}
     for name in ACTIVE:
         path = ADAPTERS.get(name)
-        if not path:
-            print(f"[BOOT] WARNING: no adapter mapped for strategy '{name}'", flush=True)
-            continue
-        mods[name] = importlib.import_module(path)
+        if path:
+            mods[name] = importlib.import_module(path)
+        else:
+            print(f"[BOOT] WARNING: no adapter for '{name}'", flush=True)
     return mods
 
 def _norm_qty(q, strat):
@@ -152,69 +142,52 @@ def _norm_qty(q, strat):
         q = int(q or 0)
     except Exception:
         q = 0
-    return q if q > 0 else _per_strat("MIN_QTY", strat, int, MIN_QTY_DEFAULT)
+    return q if q>0 else _per_strat("MIN_QTY", strat, int, MIN_QTY_DEFAULT)
 
 # =============================
 #         SCAN & RANK
 # =============================
 
 def scan_once(adapters) -> List[Candidate]:
-    candidates: List[Candidate] = []
+    cands: List[Candidate] = []
     open_syms = get_positions_symbols() if SKIP_IF_POSITION_OPEN else set()
 
-    # Universe precedence: S3 universe → SCANNER_SYMBOLS → fallback
     _load_universe(force_boot=True)
     symbols = _universe_syms or SYMBOLS or ["SPY","QQQ"]
 
     for sym in symbols:
         df1m = fetch_alpaca_1m(sym, limit=LOOKBACK_MIN)
-        if df1m is None or df1m.empty:
+        if df1m is None or df1m.empty: 
             continue
         last = float(df1m["close"].iloc[-1])
 
         for tf in TF_MIN_LIST:
             for strat, mod in adapters.items():
-                dec = getattr(mod, "decide", None)
-                if not dec:
-                    continue
-
+                dec = getattr(mod,"decide",None)
+                if not dec: continue
                 try:
                     sig = dec(sym, df1m, tf)
                 except Exception as e:
                     print(f"[{strat}] decide error {sym}:{tf}m -> {e}", flush=True)
                     continue
-
-                if not sig:
-                    continue
-
-                conf = float(sig.get("confidence", 0.0) or 0.0)
-                thr  = _per_strat("CONF_THR", strat, float, CONF_THR_DEFAULT)
-                if conf < thr:
-                    continue
-
+                if not sig: continue
+                conf = float(sig.get("confidence",0.0))
+                thr = _per_strat("CONF_THR", strat, float, CONF_THR_DEFAULT)
+                if conf < thr: continue
                 side = str(sig.get("side","")).lower()
-                if side not in ("buy","sell"):
+                if side not in ("buy","sell"): continue
+                if SKIP_IF_POSITION_OPEN and side=="buy" and sym in open_syms:
                     continue
-
-                if SKIP_IF_POSITION_OPEN and side == "buy" and sym in open_syms:
-                    # simple long-only skip if already in a long; adjust if you run shorts
-                    continue
-
                 qty = _norm_qty(sig.get("quantity"), strat)
-                tp = sig.get("takeProfit")
-                sl = sig.get("stopLoss")
+                tp  = sig.get("takeProfit")
+                sl  = sig.get("stopLoss")
+                cands.append(Candidate(strat,sym,tf,conf,side,qty,tp,sl,last))
+    return cands
 
-                candidates.append(Candidate(
-                    strategy=strat, symbol=sym, tf=tf, confidence=conf,
-                    side=side, qty=qty, tp=tp, sl=sl, last=last
-                ))
-    return candidates
-
-# ---------- helpers: optional RTH gate ----------
 def _is_rth_now() -> bool:
     now = datetime.now(ZoneInfo("America/New_York"))
-    h, m = now.hour, now.minute
-    return ((h > 9) or (h == 9 and m >= 30)) and (h < 16)
+    h,m = now.hour, now.minute
+    return ((h>9) or (h==9 and m>=30)) and (h<16)
 
 # =============================
 #     RANK, GUARD, EXECUTE
@@ -225,7 +198,7 @@ def rank_and_execute(candidates: List[Candidate]):
         print("[RANK] no candidates", flush=True)
         return
 
-    grouped: Dict[str, List[Candidate]] = defaultdict(list)
+    grouped: Dict[str,List[Candidate]] = defaultdict(list)
     for c in candidates:
         grouped[c.strategy].append(c)
 
@@ -233,33 +206,27 @@ def rank_and_execute(candidates: List[Candidate]):
 
     for strat, items in grouped.items():
         ranked_mode = strat in RANKED_STRATS
-
-        # Optional de-dup to 1 per symbol (keep highest confidence)
         if DEDUP_BY_SYMBOL:
-            best_by_symbol: Dict[str, Candidate] = {}
+            best_by_symbol: Dict[str,Candidate] = {}
             for c in items:
                 cur = best_by_symbol.get(c.symbol)
                 if cur is None or c.confidence > cur.confidence:
                     best_by_symbol[c.symbol] = c
             items = list(best_by_symbol.values())
-
-        # Sort by confidence (desc)
         items.sort(key=lambda x: x.confidence, reverse=True)
-
         if ranked_mode:
             topk = _per_strat("TOPK", strat, int, TOPK_RANKED_DEFAULT)
-            take = items[:max(0, topk)]
-            print(f"[RANK] {strat}: {len(items)} candidates -> taking top {len(take)}", flush=True)
+            take = items[:max(0,topk)]
+            print(f"[RANK] {strat}: {len(items)} → taking {len(take)}", flush=True)
             orders.extend(take)
         else:
             topk = _per_strat("TOPK", strat, int, _NONRANK_BIG)
-            take = items[:max(0, topk)]
-            print(f"[PASS] {strat}: {len(items)} candidates -> passing {len(take)}", flush=True)
+            take = items[:max(0,topk)]
+            print(f"[PASS] {strat}: {len(items)} → passing {len(take)}", flush=True)
             orders.extend(take)
 
-    # --- NEW: BP-aware + optional RTH-aware execution ---
     if REQUIRE_RTH and not _is_rth_now():
-        print("[SKIP] Outside RTH; suppressing all entries this pass.", flush=True)
+        print("[SKIP] Outside RTH; suppressing entries.", flush=True)
         return
 
     try:
@@ -271,11 +238,8 @@ def rank_and_execute(candidates: List[Candidate]):
     bp_avail = max(0.0, bp_total * (1.0 - BP_RESERVE_PCT))
 
     for o in orders:
-        # notional based on signal qty (already risk-sized in your adapters)
         notional = float(o.qty) * float(o.last)
-
-        if notional < MAX(1.0, MIN_NOTIONAL_PER_ORDER):  # allow tiny orders but avoid noise
-            # still allow; they’ll be clamped by broker if BP is truly tiny
+        if notional < max(1.0, MIN_NOTIONAL_PER_ORDER):
             pass
         elif notional > bp_avail:
             print(f"[SKIP] Low BP: need ~{notional:.2f}, have ~{bp_avail:.2f} → {o.symbol} skipped", flush=True)
