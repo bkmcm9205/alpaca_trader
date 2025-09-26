@@ -1,17 +1,39 @@
 from __future__ import annotations
 import os, time, importlib
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 from collections import defaultdict
 
 import pandas as pd
-import boto3
-from botocore.exceptions import ClientError
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.data_alpaca import fetch_alpaca_1m
-from app.broker_alpaca import place_bracket_order, get_positions_symbols
+from app.broker_alpaca import (
+    place_bracket_order,
+    get_positions_symbols,
+)
+
+# Optional broker funcs (guard/EOD actions, equity)
+try:
+    from app.broker_alpaca import get_account_summary
+except Exception:  # pragma: no cover
+    get_account_summary = None  # type: ignore
+
+try:
+    from app.broker_alpaca import cancel_all_orders, close_all_positions
+except Exception:  # pragma: no cover
+    cancel_all_orders = None  # type: ignore
+    close_all_positions = None  # type: ignore
+
+# Optional per-strategy ledger/virtual equity support
+_PNL_LOGGER_OK = False
+try:
+    from app.pnl_logger import compute_virtual_equity  # type: ignore
+    _PNL_LOGGER_OK = True
+except Exception:
+    _PNL_LOGGER_OK = False
+
 from app.strategy_registry import ADAPTERS
 
 # =============================
@@ -50,6 +72,19 @@ def _per_strat(key: str, strat: str, cast, default):
     v = os.getenv(env_key)
     return cast(v) if v is not None else default
 
+# ===== Guard ENV =====
+STRATEGY_ID = os.getenv("STRATEGY_ID", os.getenv("STRAT_TAG","GEN")).strip() or "GEN"
+USE_VIRTUAL_EQUITY = os.getenv("USE_VIRTUAL_EQUITY","0").lower() in ("1","true","yes")
+DAILY_PROFIT_TARGET_PCT = float(os.getenv("DAILY_PROFIT_TARGET_PCT","0.10"))
+DAILY_DRAWDOWN_PCT      = float(os.getenv("DAILY_DRAWDOWN_PCT","0.05"))
+GUARD_FLATTEN           = os.getenv("GUARD_FLATTEN","true").lower() in ("1","true","yes")
+# EOD flatten window (ET)
+EOD_FLATTEN_START_ET    = os.getenv("EOD_FLATTEN_START_ET","16:00")
+EOD_FLATTEN_END_ET      = os.getenv("EOD_FLATTEN_END_ET","16:10")
+# Guard logging verbosity
+_GUARD_DEBUG            = os.getenv("GUARD_DEBUG","0").lower() in ("1","true","yes")
+_GUARD_EVERY_N          = int(os.getenv("GUARD_LOG_EVERY_N_LOOPS","12"))
+
 # =============================
 #   PRE-MARKET UNIVERSE LOADER
 # =============================
@@ -58,10 +93,13 @@ _universe_syms: List[str] = []
 _universe_loaded_day = None
 _universe_last_check = 0.0
 
+def _now_et() -> datetime:
+    return datetime.now(ZoneInfo("America/New_York"))
+
 def _in_window(window: str) -> bool:
     try:
         s,e = window.split("-",1)
-        now_hm = datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M")
+        now_hm = _now_et().strftime("%H:%M")
         return s <= now_hm <= e
     except Exception:
         return False
@@ -85,11 +123,13 @@ def _load_universe(force_boot: bool = False):
         _universe_last_check = now
         if not _in_window(UNIVERSE_RELOAD_WINDOW_ET):
             return
-        today = datetime.now(ZoneInfo("America/New_York")).date()
+        today = _now_et().date()
         if _universe_loaded_day == today:
             return
 
     try:
+        import boto3
+        from botocore.exceptions import ClientError
         s3 = boto3.client(
             "s3",
             region_name=S3_REGION,
@@ -106,9 +146,9 @@ def _load_universe(force_boot: bool = False):
             syms.append(sym)
         if syms:
             _universe_syms = syms
-            _universe_loaded_day = datetime.now(ZoneInfo("America/New_York")).date()
+            _universe_loaded_day = _now_et().date()
             print(f"[UNIVERSE] loaded {len(syms)} symbols from s3://{S3_BUCKET}/{UNIVERSE_S3_KEY}", flush=True)
-    except ClientError as e:
+    except Exception as e:
         print(f"[UNIVERSE] load error: {e}", flush=True)
 
 # =============================
@@ -143,6 +183,36 @@ def _norm_qty(q, strat):
     except Exception:
         q = 0
     return q if q > 0 else _per_strat("MIN_QTY", strat, int, MIN_QTY_DEFAULT)
+
+# =============================
+#      GUARD LOGGING HELPERS
+# =============================
+
+def _fmt_usd(x) -> str:
+    try:
+        return f"${float(x):,.2f}"
+    except Exception:
+        return str(x)
+
+_GUARD_LOOP_COUNTER = 0
+_account_baseline: Optional[float] = None
+_halt_entries: bool = False  # set when TP/DD hits
+
+def _guard_log(strategy_id: str, baseline: float, eq_now: float,
+               tp_pct: float, dd_pct: float, star: bool = False) -> None:
+    up_lim = baseline * (1.0 + tp_pct)
+    dn_lim = baseline * (1.0 - dd_pct)
+    tag = "GUARD*" if star else "GUARD"
+    print(
+        f"[{tag}:{strategy_id}] baseline={_fmt_usd(baseline)}  "
+        f"now={_fmt_usd(eq_now)}  "
+        f"targets +{tp_pct*100:.1f}%({_fmt_usd(up_lim)}) / -{dd_pct*100:.1f}%({_fmt_usd(dn_lim)})",
+        flush=True
+    )
+
+def _market_opened_et() -> bool:
+    now = _now_et()
+    return (now.hour > 9) or (now.hour == 9 and now.minute >= 30)
 
 # =============================
 #         SCAN & RANK
@@ -200,10 +270,10 @@ def scan_once(adapters) -> List[Candidate]:
                 ))
     return candidates
 
-def rank_and_execute(candidates: List[Candidate]):
+def rank_and_select(candidates: List[Candidate]) -> List[Candidate]:
     if not candidates:
         print("[RANK] no candidates", flush=True)
-        return
+        return []
 
     grouped: Dict[str, List[Candidate]] = defaultdict(list)
     for c in candidates:
@@ -237,6 +307,15 @@ def rank_and_execute(candidates: List[Candidate]):
             print(f"[PASS] {strat}: {len(items)} candidates -> passing {len(take)}", flush=True)
             orders.extend(take)
 
+    return orders
+
+def execute(orders: List[Candidate]):
+    if not orders:
+        return
+    if _halt_entries:
+        print(f"[GUARD:{STRATEGY_ID}] entries halted for the day.", flush=True)
+        return
+
     for o in orders:
         if DRY_RUN:
             print(f"[DRY] {o.strategy} conf={o.confidence:.4f} {o.symbol}:{o.tf}m side={o.side} qty={o.qty} tp={o.tp} sl={o.sl}", flush=True)
@@ -245,10 +324,76 @@ def rank_and_execute(candidates: List[Candidate]):
             print(f"[ORDER] {o.strategy} {o.symbol}:{o.tf}m conf={o.confidence:.4f} side={o.side} qty={o.qty} ok={ok} info={str(info)[:160]}", flush=True)
 
 # =============================
+#       EQUITY & GUARDS
+# =============================
+
+def _account_equity_now() -> Optional[float]:
+    if get_account_summary is None:
+        return None
+    try:
+        acct = get_account_summary()
+        # prefer "equity" if provided as float
+        if isinstance(acct, dict) and "equity" in acct:
+            return float(acct["equity"])
+    except Exception as e:
+        print(f"[GUARD] account equity fetch error: {e}", flush=True)
+    return None
+
+def _virtual_equity_now(price_map: Dict[str, float], baseline_hint: Optional[float]) -> Optional[float]:
+    if not (USE_VIRTUAL_EQUITY and _PNL_LOGGER_OK):
+        return None
+    try:
+        bh = float(baseline_hint) if (baseline_hint is not None) else None
+    except Exception:
+        bh = None
+    try:
+        # compute_virtual_equity returns dict with baseline, mtm, virtual_equity
+        res = compute_virtual_equity(STRATEGY_ID, bh if bh is not None else 0.0, price_map)
+        return float(res.get("virtual_equity"))
+    except Exception as e:
+        print(f"[GUARD] virtual equity error: {e}", flush=True)
+        return None
+
+def _maybe_guard_and_halt(eq_now: float, baseline: float) -> bool:
+    """Returns True if guard tripped (and performs flatten if configured)."""
+    global _halt_entries
+    tp_hit = eq_now >= baseline * (1.0 + DAILY_PROFIT_TARGET_PCT)
+    dd_hit = eq_now <= baseline * (1.0 - DAILY_DRAWDOWN_PCT)
+    if tp_hit or dd_hit:
+        _guard_log(STRATEGY_ID, baseline, eq_now, DAILY_PROFIT_TARGET_PCT, DAILY_DRAWDOWN_PCT, star=True)
+        _halt_entries = True
+        if GUARD_FLATTEN and not DRY_RUN:
+            # Best-effort account-wide flatten (safer). If you later want per-strategy-only,
+            # wire ledger-driven offsets here.
+            try:
+                if cancel_all_orders: cancel_all_orders()
+                if close_all_positions: close_all_positions()
+                print(f"[GUARD:{STRATEGY_ID}] FLATTEN requested (cancel orders + close positions).", flush=True)
+            except Exception as e:
+                print(f"[GUARD] flatten error: {e}", flush=True)
+        else:
+            print(f"[GUARD:{STRATEGY_ID}] Entries halted (no flatten in DRY_RUN={int(DRY_RUN)}).", flush=True)
+        return True
+    return False
+
+def _within_eod_flatten_window() -> bool:
+    try:
+        start_h, start_m = [int(x) for x in EOD_FLATTEN_START_ET.split(":")]
+        end_h, end_m     = [int(x) for x in EOD_FLATTEN_END_ET.split(":")]
+        now = _now_et()
+        start = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+        end   = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+        return start <= now <= end
+    except Exception:
+        return False
+
+# =============================
 #             MAIN
 # =============================
 
 def main():
+    global _GUARD_LOOP_COUNTER, _account_baseline, _halt_entries
+
     adapters = _load_adapters()
     print(f"[BOOT] ACTIVE={list(adapters.keys())} TFs={TF_MIN_LIST} DRY_RUN={int(DRY_RUN)} RANKED_STRATS={RANKED_STRATS}", flush=True)
     if UNIVERSE_S3_KEY:
@@ -258,14 +403,76 @@ def main():
     else:
         print("[BOOT] No universe set; fallback to ['SPY','QQQ']", flush=True)
 
+    # Attempt to set session baseline as soon as market opens and equity is available
+    _account_baseline = None
+    _halt_entries = False
+
     while True:
-        start = time.time()
+        loop_start = time.time()
         try:
+            # =======================
+            # Equity / Guard handling
+            # =======================
+            eq_acct = _account_equity_now()
+            if _account_baseline is None and _market_opened_et() and eq_acct is not None:
+                _account_baseline = float(eq_acct)
+                print(f"[GUARD:{STRATEGY_ID}] session baseline set to {_fmt_usd(_account_baseline)}.", flush=True)
+
+            # Build a light price map from last known prices (from quick sample of universe)
+            price_map: Dict[str, float] = {}
+
+            # Scan + rank (but only execute if not halted)
             cands = scan_once(adapters)
-            rank_and_execute(cands)
+
+            # Use candidates’ last prices to enrich price_map (helps virtual equity MTM)
+            for c in cands:
+                price_map[c.symbol] = c.last
+
+            # Determine equity now (virtual if enabled and available, else account)
+            eq_now: Optional[float] = None
+            baseline_for_log: Optional[float] = _account_baseline
+
+            if USE_VIRTUAL_EQUITY and _PNL_LOGGER_OK and (_account_baseline is not None):
+                veq = _virtual_equity_now(price_map, _account_baseline)
+                if isinstance(veq, (int, float)):
+                    eq_now = float(veq)
+                    baseline_for_log = float(_account_baseline)
+            if eq_now is None and eq_acct is not None:
+                eq_now = float(eq_acct)
+
+            # Periodic guard banner
+            if (eq_now is not None) and (baseline_for_log is not None):
+                if _GUARD_LOOP_COUNTER == 0:
+                    _guard_log(STRATEGY_ID, baseline_for_log, eq_now, DAILY_PROFIT_TARGET_PCT, DAILY_DRAWDOWN_PCT, star=False)
+                else:
+                    if _GUARD_DEBUG or (_GUARD_LOOP_COUNTER % max(1, _GUARD_EVERY_N) == 0):
+                        _guard_log(STRATEGY_ID, baseline_for_log, eq_now, DAILY_PROFIT_TARGET_PCT, DAILY_DRAWDOWN_PCT, star=False)
+
+                # Check guard trip
+                if not _halt_entries and _maybe_guard_and_halt(eq_now, baseline_for_log):
+                    # if tripped, skip execution this loop (entries halted)
+                    pass
+
+            _GUARD_LOOP_COUNTER += 1
+
+            # EOD flatten window (best-effort, idempotent)
+            if _within_eod_flatten_window():
+                if not DRY_RUN and close_all_positions:
+                    try:
+                        print("[EOD] Auto-flatten window.", flush=True)
+                        if cancel_all_orders: cancel_all_orders()
+                        close_all_positions()
+                    except Exception as e:
+                        print(f"[EOD] flatten error: {e}", flush=True)
+
+            # Rank & possibly execute (if not halted)
+            orders = rank_and_select(cands)
+            execute(orders)
+
         except Exception as e:
             print(f"[LOOP ERROR] {e}", flush=True)
-        elapsed = time.time() - start
+
+        elapsed = time.time() - loop_start
         time.sleep(max(1, POLL_SECONDS - int(elapsed)))
 
 if __name__ == "__main__":
