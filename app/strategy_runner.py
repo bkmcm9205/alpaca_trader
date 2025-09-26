@@ -1,11 +1,11 @@
 from __future__ import annotations
-import os, time, importlib
+import os, time, importlib, hashlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 from collections import defaultdict
 
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.data_alpaca import fetch_alpaca_1m
@@ -14,25 +14,30 @@ from app.broker_alpaca import (
     get_positions_symbols,
 )
 
-# Optional broker funcs (guard/EOD actions, equity)
+# Optional broker funcs (equity, cancel/close, fills)
 try:
     from app.broker_alpaca import get_account_summary
-except Exception:  # pragma: no cover
+except Exception:
     get_account_summary = None  # type: ignore
 
 try:
     from app.broker_alpaca import cancel_all_orders, close_all_positions
-except Exception:  # pragma: no cover
+except Exception:
     cancel_all_orders = None  # type: ignore
     close_all_positions = None  # type: ignore
 
-# Optional per-strategy ledger/virtual equity support
-_PNL_LOGGER_OK = False
 try:
-    from app.pnl_logger import compute_virtual_equity  # type: ignore
-    _PNL_LOGGER_OK = True
+    from app.broker_alpaca import get_today_fills  # should return list of dicts
 except Exception:
-    _PNL_LOGGER_OK = False
+    get_today_fills = None  # type: ignore
+
+# Per-strategy logging + virtual equity
+_PNL_OK = False
+try:
+    from app.pnl_logger import append_trades, update_ledger_with_fills, compute_virtual_equity  # type: ignore
+    _PNL_OK = True
+except Exception:
+    _PNL_OK = False
 
 from app.strategy_registry import ADAPTERS
 
@@ -52,13 +57,14 @@ SYMBOLS = [s.strip().upper() for s in os.getenv("SCANNER_SYMBOLS","").split(",")
 TF_MIN_LIST = [int(x) for x in os.getenv("TF_MIN_LIST","5,15").split(",") if x.strip()]
 
 ACTIVE = [s.strip() for s in os.getenv("ACTIVE_STRATEGIES","trading_bot,ml_merged,ranked_ml").split(",") if s.strip()]
+STRATEGY_NAME = ACTIVE[0] if ACTIVE else "unknown"  # first active name (your runners use one strategy per worker)
 
 LOOKBACK_MIN = int(os.getenv("LOOKBACK_MIN","2400"))     # ~40h of 1m bars
 POLL_SECONDS = int(os.getenv("POLL_SECONDS","20"))
 
-DRY_RUN = os.getenv("DRY_RUN","1") in ("1","true","True")
-DEDUP_BY_SYMBOL = os.getenv("DEDUP_BY_SYMBOL","1") in ("1","true","True")
-SKIP_IF_POSITION_OPEN = os.getenv("SKIP_IF_POSITION_OPEN","1") in ("1","true","True")
+DRY_RUN = os.getenv("DRY_RUN","1").lower() in ("1","true","yes")
+DEDUP_BY_SYMBOL = os.getenv("DEDUP_BY_SYMBOL","1").lower() in ("1","true","yes")
+SKIP_IF_POSITION_OPEN = os.getenv("SKIP_IF_POSITION_OPEN","1").lower() in ("1","true","yes")
 
 # Ranking applies only to these strategies (your core: ranked_ml)
 RANKED_STRATS = [s.strip() for s in os.getenv("RANKED_STRATS","ranked_ml").split(",") if s.strip()]
@@ -72,7 +78,7 @@ def _per_strat(key: str, strat: str, cast, default):
     v = os.getenv(env_key)
     return cast(v) if v is not None else default
 
-# ===== Guard ENV =====
+# ===== Guard + logging ENV =====
 STRATEGY_ID = os.getenv("STRATEGY_ID", os.getenv("STRAT_TAG","GEN")).strip() or "GEN"
 USE_VIRTUAL_EQUITY = os.getenv("USE_VIRTUAL_EQUITY","0").lower() in ("1","true","yes")
 DAILY_PROFIT_TARGET_PCT = float(os.getenv("DAILY_PROFIT_TARGET_PCT","0.10"))
@@ -111,7 +117,6 @@ def _load_universe(force_boot: bool = False):
         return
 
     def _clean_sym(s: str) -> str:
-        # strip UTF-8 BOM + whitespace + normalize to UPPER
         return s.replace("\ufeff", "").strip().upper()
 
     now = time.time()
@@ -129,7 +134,6 @@ def _load_universe(force_boot: bool = False):
 
     try:
         import boto3
-        from botocore.exceptions import ClientError
         s3 = boto3.client(
             "s3",
             region_name=S3_REGION,
@@ -222,7 +226,6 @@ def scan_once(adapters) -> List[Candidate]:
     candidates: List[Candidate] = []
     open_syms = get_positions_symbols() if SKIP_IF_POSITION_OPEN else set()
 
-    # Universe precedence: S3 universe → SCANNER_SYMBOLS → fallback
     _load_universe(force_boot=True)
     symbols = _universe_syms or SYMBOLS or ["SPY","QQQ"]
 
@@ -257,7 +260,6 @@ def scan_once(adapters) -> List[Candidate]:
                     continue
 
                 if SKIP_IF_POSITION_OPEN and side == "buy" and sym in open_syms:
-                    # simple long-only skip if already in a long; adjust if you run shorts
                     continue
 
                 qty = _norm_qty(sig.get("quantity"), strat)
@@ -284,7 +286,6 @@ def rank_and_select(candidates: List[Candidate]) -> List[Candidate]:
     for strat, items in grouped.items():
         ranked_mode = strat in RANKED_STRATS
 
-        # Optional de-dup to 1 per symbol (keep highest confidence)
         if DEDUP_BY_SYMBOL:
             best_by_symbol: Dict[str, Candidate] = {}
             for c in items:
@@ -293,7 +294,6 @@ def rank_and_select(candidates: List[Candidate]) -> List[Candidate]:
                     best_by_symbol[c.symbol] = c
             items = list(best_by_symbol.values())
 
-        # Sort by confidence (desc)
         items.sort(key=lambda x: x.confidence, reverse=True)
 
         if ranked_mode:
@@ -332,27 +332,83 @@ def _account_equity_now() -> Optional[float]:
         return None
     try:
         acct = get_account_summary()
-        # prefer "equity" if provided as float
         if isinstance(acct, dict) and "equity" in acct:
             return float(acct["equity"])
     except Exception as e:
         print(f"[GUARD] account equity fetch error: {e}", flush=True)
     return None
 
-def _virtual_equity_now(price_map: Dict[str, float], baseline_hint: Optional[float]) -> Optional[float]:
-    if not (USE_VIRTUAL_EQUITY and _PNL_LOGGER_OK):
-        return None
+def _maybe_pull_and_log_fills(eq_now: Optional[float]) -> Dict[str, float]:
+    """
+    Pull today's fills, filter by our client_order_id prefix STRATEGY_ID-STRATEGY_NAME,
+    update per-strategy ledger, and append S3 trade rows.
+    Returns a price_map (symbol->last price) derived from observed fills; the scan will enrich more.
+    """
+    price_map: Dict[str, float] = {}
+    if not (_PNL_OK and callable(get_today_fills)):  # type: ignore
+        return price_map
+
     try:
-        bh = float(baseline_hint) if (baseline_hint is not None) else None
+        fills = get_today_fills()  # expected to return list of dicts
+    except TypeError:
+        # If your get_today_fills requires args, wire a no-arg wrapper in broker_alpaca.
+        try:
+            fills = []  # graceful fallback
+        except Exception:
+            fills = []
     except Exception:
-        bh = None
+        fills = []
+
+    if not fills:
+        return price_map
+
+    prefix = f"{STRATEGY_ID}-{STRATEGY_NAME}"
+    my_fills = [f for f in fills if str(f.get("client_order_id","")).startswith(prefix)]
+    if not my_fills:
+        return price_map
+
+    # Update per-strategy ledger with our fills
     try:
-        # compute_virtual_equity returns dict with baseline, mtm, virtual_equity
-        res = compute_virtual_equity(STRATEGY_ID, bh if bh is not None else 0.0, price_map)
-        return float(res.get("virtual_equity"))
+        update_ledger_with_fills(STRATEGY_ID, [
+            {
+                "symbol": f.get("symbol"),
+                "side": str(f.get("side","")).lower(),
+                "qty":  f.get("qty", f.get("quantity", "0")),
+                "price":f.get("price", f.get("fill_price", "0")),
+            } for f in my_fills if f.get("symbol")
+        ])
     except Exception as e:
-        print(f"[GUARD] virtual equity error: {e}", flush=True)
-        return None
+        print(f"[PNL] ledger update error: {e}", flush=True)
+
+    # Append S3 trade log rows
+    try:
+        ts = datetime.now().astimezone().isoformat()
+        rows = []
+        for f in my_fills:
+            sym = f.get("symbol")
+            if sym:
+                try:
+                    price_map[sym] = float(f.get("price", f.get("fill_price", "0")) or 0.0)
+                except Exception:
+                    pass
+            rows.append({
+                "ts_utc": ts,
+                "symbol": sym or "",
+                "side": str(f.get("side","")).lower(),
+                "qty": str(f.get("qty", f.get("quantity",""))),
+                "avg_fill": str(f.get("price", f.get("fill_price",""))),
+                "client_order_id": str(f.get("client_order_id","")),
+                "strategy": STRATEGY_NAME,
+                "tag": STRATEGY_ID,
+                "realized_pnl": str(f.get("profit_loss","")),
+                "unrealized_pnl": "",
+                "account_equity": "" if eq_now is None else f"{eq_now}",
+            })
+        append_trades(rows)
+    except Exception as e:
+        print(f"[PNL] append trades error: {e}", flush=True)
+
+    return price_map
 
 def _maybe_guard_and_halt(eq_now: float, baseline: float) -> bool:
     """Returns True if guard tripped (and performs flatten if configured)."""
@@ -363,8 +419,6 @@ def _maybe_guard_and_halt(eq_now: float, baseline: float) -> bool:
         _guard_log(STRATEGY_ID, baseline, eq_now, DAILY_PROFIT_TARGET_PCT, DAILY_DRAWDOWN_PCT, star=True)
         _halt_entries = True
         if GUARD_FLATTEN and not DRY_RUN:
-            # Best-effort account-wide flatten (safer). If you later want per-strategy-only,
-            # wire ledger-driven offsets here.
             try:
                 if cancel_all_orders: cancel_all_orders()
                 if close_all_positions: close_all_positions()
@@ -403,44 +457,47 @@ def main():
     else:
         print("[BOOT] No universe set; fallback to ['SPY','QQQ']", flush=True)
 
-    # Attempt to set session baseline as soon as market opens and equity is available
     _account_baseline = None
     _halt_entries = False
 
     while True:
         loop_start = time.time()
         try:
-            # =======================
-            # Equity / Guard handling
-            # =======================
+            # ===== Equity baseline (post-open) =====
             eq_acct = _account_equity_now()
             if _account_baseline is None and _market_opened_et() and eq_acct is not None:
                 _account_baseline = float(eq_acct)
                 print(f"[GUARD:{STRATEGY_ID}] session baseline set to {_fmt_usd(_account_baseline)}.", flush=True)
 
-            # Build a light price map from last known prices (from quick sample of universe)
-            price_map: Dict[str, float] = {}
+            # ===== Pull fills → ledger + S3 trades =====
+            price_map_from_fills = _maybe_pull_and_log_fills(eq_acct)
 
-            # Scan + rank (but only execute if not halted)
+            # ===== Scan & rank =====
             cands = scan_once(adapters)
 
-            # Use candidates’ last prices to enrich price_map (helps virtual equity MTM)
+            # Build price_map from candidates' latest prices (augment)
+            price_map: Dict[str, float] = dict(price_map_from_fills)
             for c in cands:
-                price_map[c.symbol] = c.last
+                if c.symbol not in price_map:
+                    price_map[c.symbol] = c.last
 
-            # Determine equity now (virtual if enabled and available, else account)
+            # ===== Determine equity now (virtual if available) =====
             eq_now: Optional[float] = None
             baseline_for_log: Optional[float] = _account_baseline
 
-            if USE_VIRTUAL_EQUITY and _PNL_LOGGER_OK and (_account_baseline is not None):
-                veq = _virtual_equity_now(price_map, _account_baseline)
-                if isinstance(veq, (int, float)):
-                    eq_now = float(veq)
-                    baseline_for_log = float(_account_baseline)
+            if USE_VIRTUAL_EQUITY and _PNL_OK and (_account_baseline is not None):
+                try:
+                    veq = compute_virtual_equity(STRATEGY_ID, _account_baseline, price_map)
+                    if isinstance(veq, dict) and "virtual_equity" in veq:
+                        eq_now = float(veq["virtual_equity"])
+                        baseline_for_log = float(veq.get("baseline", _account_baseline))
+                except Exception as e:
+                    print(f"[GUARD] virtual equity error: {e}", flush=True)
+
             if eq_now is None and eq_acct is not None:
                 eq_now = float(eq_acct)
 
-            # Periodic guard banner
+            # ===== Guard logs + checks =====
             if (eq_now is not None) and (baseline_for_log is not None):
                 if _GUARD_LOOP_COUNTER == 0:
                     _guard_log(STRATEGY_ID, baseline_for_log, eq_now, DAILY_PROFIT_TARGET_PCT, DAILY_DRAWDOWN_PCT, star=False)
@@ -448,14 +505,12 @@ def main():
                     if _GUARD_DEBUG or (_GUARD_LOOP_COUNTER % max(1, _GUARD_EVERY_N) == 0):
                         _guard_log(STRATEGY_ID, baseline_for_log, eq_now, DAILY_PROFIT_TARGET_PCT, DAILY_DRAWDOWN_PCT, star=False)
 
-                # Check guard trip
                 if not _halt_entries and _maybe_guard_and_halt(eq_now, baseline_for_log):
-                    # if tripped, skip execution this loop (entries halted)
-                    pass
+                    pass  # guard tripped; entries halted
 
             _GUARD_LOOP_COUNTER += 1
 
-            # EOD flatten window (best-effort, idempotent)
+            # ===== EOD flatten window =====
             if _within_eod_flatten_window():
                 if not DRY_RUN and close_all_positions:
                     try:
@@ -465,7 +520,7 @@ def main():
                     except Exception as e:
                         print(f"[EOD] flatten error: {e}", flush=True)
 
-            # Rank & possibly execute (if not halted)
+            # ===== Execute =====
             orders = rank_and_select(cands)
             execute(orders)
 
