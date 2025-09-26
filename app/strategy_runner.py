@@ -1,26 +1,23 @@
 # app/strategy_runner.py
 from __future__ import annotations
-
-import os, time, importlib, math
+import os, time, importlib
 from dataclasses import dataclass
 from typing import Dict, List
 from collections import defaultdict
 
 import pandas as pd
 import boto3
-from botocore.exceptions import ClientError, BotoCoreError
+from botocore.exceptions import ClientError
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.data_alpaca import fetch_alpaca_1m
-from app.broker_alpaca import place_bracket_order, get_positions_symbols
+from app.broker_alpaca import (
+    place_bracket_order,
+    get_positions_symbols,
+    get_account_summary,
+)
 from app.strategy_registry import ADAPTERS
-
-# Optional: force model preload at boot so you see "[MODEL:...] loaded ..." once
-try:
-    from app.strategies.model_runtime import maybe_load_model
-except Exception:
-    maybe_load_model = None
 
 # =============================
 #         ENV / CONFIG
@@ -50,15 +47,13 @@ SKIP_IF_POSITION_OPEN = os.getenv("SKIP_IF_POSITION_OPEN","1") in ("1","true","T
 RANKED_STRATS = [s.strip() for s in os.getenv("RANKED_STRATS","ranked_ml").split(",") if s.strip()]
 TOPK_RANKED_DEFAULT = int(os.getenv("TOPK_RANKED_DEFAULT","1"))       # take top-K for ranked strats
 CONF_THR_DEFAULT = float(os.getenv("CONF_THR_DEFAULT","0.05"))
-MIN_QTY_DEFAULT = int(os.getenv("MIN_QTY_DEFAULT","1"))  # used only if risk-based can't compute qty
+MIN_QTY_DEFAULT = int(os.getenv("MIN_QTY_DEFAULT","1"))
 _NONRANK_BIG = 10**9  # effectively "no cap" for non-ranked unless TOPK_<STRAT> set
 
-# ----- Risk-based sizing env (RESTORED like your old models) -----
-EQUITY_USD  = float(os.getenv("EQUITY_USD",  "100000"))
-RISK_PCT    = float(os.getenv("RISK_PCT",    "0.01"))   # 1% risk per trade
-MAX_POS_PCT = float(os.getenv("MAX_POS_PCT", "0.05"))   # 5% notional cap per trade
-MIN_QTY_ENV = int(os.getenv("MIN_QTY", "1"))
-ROUND_LOT   = int(os.getenv("ROUND_LOT","1"))
+# --- NEW: Buying power & RTH guards ---
+BP_RESERVE_PCT = float(os.getenv("BP_RESERVE_PCT", "0.10"))          # keep 10% buffer
+MIN_NOTIONAL_PER_ORDER = float(os.getenv("MIN_NOTIONAL_PER_ORDER", "50"))
+REQUIRE_RTH = os.getenv("REQUIRE_RTH", "0") in ("1","true","True")   # optional: block entries outside 9:30–16:00 ET
 
 def _per_strat(key: str, strat: str, cast, default):
     env_key = f"{key}_{strat.upper()}"
@@ -123,7 +118,7 @@ def _load_universe(force_boot: bool = False):
             _universe_syms = syms
             _universe_loaded_day = datetime.now(ZoneInfo("America/New_York")).date()
             print(f"[UNIVERSE] loaded {len(syms)} symbols from s3://{S3_BUCKET}/{UNIVERSE_S3_KEY}", flush=True)
-    except (ClientError, BotoCoreError) as e:
+    except ClientError as e:
         print(f"[UNIVERSE] load error: {e}", flush=True)
 
 # =============================
@@ -149,68 +144,15 @@ def _load_adapters():
         if not path:
             print(f"[BOOT] WARNING: no adapter mapped for strategy '{name}'", flush=True)
             continue
-        try:
-            mods[name] = importlib.import_module(path)
-        except Exception as e:
-            print(f"[BOOT] ERROR: failed to import adapter '{name}' -> {e}", flush=True)
+        mods[name] = importlib.import_module(path)
     return mods
 
-# =============================
-#     RISK-BASED SIZING (RESTORED)
-# =============================
-
-def _stop_price_from(last: float, sl_val: float | None, side: str) -> float | None:
-    """
-    sl_val may be percentage (<1) or absolute (>=1).
-    For longs (buy): stop below entry. For shorts (sell): stop above entry.
-    """
-    if sl_val is None:
-        return None
+def _norm_qty(q, strat):
     try:
-        v = float(sl_val)
-    except Exception:
-        return None
-    if v <= 0:
-        return None
-    if v < 1.0:
-        # percent input
-        return last * (1.0 - v) if side == "buy" else last * (1.0 + v)
-    else:
-        # absolute input
-        return float(v)
-
-def _qty_from_risk(last: float, stop: float | None, equity=EQUITY_USD,
-                   risk_pct=RISK_PCT, max_pos_pct=MAX_POS_PCT,
-                   min_qty=MIN_QTY_ENV, round_lot=ROUND_LOT) -> int:
-    if last is None or stop is None:
-        return 0
-    risk_per_share = abs(float(last) - float(stop))
-    if risk_per_share <= 0:
-        return 0
-    qty_risk     = (equity * risk_pct) / risk_per_share
-    qty_notional = (equity * max_pos_pct) / max(1e-9, float(last))
-    qty = math.floor(max(min(qty_risk, qty_notional), 0) / max(1, round_lot)) * max(1, round_lot)
-    if qty <= 0:
-        return 0
-    return int(max(qty, min_qty))
-
-def _compute_qty(side: str, qty_signal, last: float, sl_val: float | None) -> int:
-    """
-    If strategy provided a positive quantity, honor it.
-    Otherwise compute from risk using stopLoss and last price.
-    Fallback to MIN_QTY_DEFAULT only if we cannot compute a risk-based size.
-    """
-    try:
-        q = int(qty_signal or 0)
+        q = int(q or 0)
     except Exception:
         q = 0
-    if q > 0:
-        return q
-    stop = _stop_price_from(last, sl_val, side)
-    q_risk = _qty_from_risk(last, stop)
-    if q_risk > 0:
-        return q_risk
-    return MIN_QTY_DEFAULT
+    return q if q > 0 else _per_strat("MIN_QTY", strat, int, MIN_QTY_DEFAULT)
 
 # =============================
 #         SCAN & RANK
@@ -225,20 +167,10 @@ def scan_once(adapters) -> List[Candidate]:
     symbols = _universe_syms or SYMBOLS or ["SPY","QQQ"]
 
     for sym in symbols:
-        # Fetch bars; quietly skip symbols that error (e.g., Alpaca 500s)
-        try:
-            df1m = fetch_alpaca_1m(sym, limit=LOOKBACK_MIN)
-        except Exception:
-            continue
-
+        df1m = fetch_alpaca_1m(sym, limit=LOOKBACK_MIN)
         if df1m is None or df1m.empty:
             continue
-
-        # last price
-        try:
-            last = float(df1m["close"].iloc[-1])
-        except Exception:
-            continue
+        last = float(df1m["close"].iloc[-1])
 
         for tf in TF_MIN_LIST:
             for strat, mod in adapters.items():
@@ -265,12 +197,10 @@ def scan_once(adapters) -> List[Candidate]:
                     continue
 
                 if SKIP_IF_POSITION_OPEN and side == "buy" and sym in open_syms:
-                    # long-only de-dupe; adjust if you also run shorts netting
+                    # simple long-only skip if already in a long; adjust if you run shorts
                     continue
 
-                # Risk-based sizing if strategy didn't set quantity
-                qty = _compute_qty(side, sig.get("quantity"), last, sig.get("stopLoss"))
-
+                qty = _norm_qty(sig.get("quantity"), strat)
                 tp = sig.get("takeProfit")
                 sl = sig.get("stopLoss")
 
@@ -279,6 +209,16 @@ def scan_once(adapters) -> List[Candidate]:
                     side=side, qty=qty, tp=tp, sl=sl, last=last
                 ))
     return candidates
+
+# ---------- helpers: optional RTH gate ----------
+def _is_rth_now() -> bool:
+    now = datetime.now(ZoneInfo("America/New_York"))
+    h, m = now.hour, now.minute
+    return ((h > 9) or (h == 9 and m >= 30)) and (h < 16)
+
+# =============================
+#     RANK, GUARD, EXECUTE
+# =============================
 
 def rank_and_execute(candidates: List[Candidate]):
     if not candidates:
@@ -317,12 +257,37 @@ def rank_and_execute(candidates: List[Candidate]):
             print(f"[PASS] {strat}: {len(items)} candidates -> passing {len(take)}", flush=True)
             orders.extend(take)
 
+    # --- NEW: BP-aware + optional RTH-aware execution ---
+    if REQUIRE_RTH and not _is_rth_now():
+        print("[SKIP] Outside RTH; suppressing all entries this pass.", flush=True)
+        return
+
+    try:
+        acct = get_account_summary()
+        bp_total = float(acct.get("buying_power") or 0.0)
+    except Exception:
+        bp_total = 0.0
+
+    bp_avail = max(0.0, bp_total * (1.0 - BP_RESERVE_PCT))
+
     for o in orders:
+        # notional based on signal qty (already risk-sized in your adapters)
+        notional = float(o.qty) * float(o.last)
+
+        if notional < MAX(1.0, MIN_NOTIONAL_PER_ORDER):  # allow tiny orders but avoid noise
+            # still allow; they’ll be clamped by broker if BP is truly tiny
+            pass
+        elif notional > bp_avail:
+            print(f"[SKIP] Low BP: need ~{notional:.2f}, have ~{bp_avail:.2f} → {o.symbol} skipped", flush=True)
+            continue
+
         if DRY_RUN:
             print(f"[DRY] {o.strategy} conf={o.confidence:.4f} {o.symbol}:{o.tf}m side={o.side} qty={o.qty} tp={o.tp} sl={o.sl}", flush=True)
         else:
             ok, info = place_bracket_order(o.symbol, o.side, o.qty, o.last, o.tp, o.sl)
-            print(f"[ORDER] {o.strategy} {o.symbol}:{o.tf}m conf={o.confidence:.4f} side={o.side} qty={o.qty} ok={ok} info={str(info)[:160]}", flush=True)
+            print(f"[ORDER] {o.strategy} {o.symbol}:{o.tf}m conf={o.confidence:.4f} side={o.side} qty={o.qty} ok={ok} info={str(info)[:200]}", flush=True)
+            if ok:
+                bp_avail = max(0.0, bp_avail - notional)
 
 # =============================
 #             MAIN
@@ -337,17 +302,6 @@ def main():
         print(f"[BOOT] Using SCANNER_SYMBOLS={SYMBOLS}", flush=True)
     else:
         print("[BOOT] No universe set; fallback to ['SPY','QQQ']", flush=True)
-
-    # Optional: preload models so loader logs once at boot
-    if maybe_load_model:
-        try:
-            print(f"[BOOT] Preloading models for: {list(adapters.keys())}", flush=True)
-            for strat in adapters.keys():
-                obj = maybe_load_model(strat)
-                _ = "ready" if obj is not None else "not-found"
-                print(f"[MODEL-PRELOAD:{strat}] { _ }.", flush=True)
-        except Exception as e:
-            print(f"[BOOT] preload error: {e}", flush=True)
 
     while True:
         start = time.time()
