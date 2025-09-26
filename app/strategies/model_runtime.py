@@ -1,6 +1,6 @@
 # app/strategies/model_runtime.py
 from __future__ import annotations
-import os, pickle, io
+import os, pickle, io, json
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 from datetime import datetime
@@ -35,7 +35,7 @@ _registry = S3ModelRegistry(
 
 def _in_window(window: str) -> bool:
     """
-    Inclusive HH:MM-HH:MM in ET.  If parse fails, be permissive (True).
+    Inclusive HH:MM-HH:MM in ET. If parse fails, be permissive (True).
     """
     try:
         s, e = window.split("-", 1)
@@ -44,10 +44,40 @@ def _in_window(window: str) -> bool:
     except Exception:
         return True
 
+def _deserialize_artifact(art_bytes: bytes) -> dict:
+    """
+    Accept either:
+      - pickle bytes of a dict like {"clf": sklearn_model, "features":[...], ...}
+      - JSON bytes of a dict (older trainer artifact). We wrap it into a trivial prior model.
+    Returns a dict that proba_up_for() can handle.
+    """
+    # Try pickle first
+    try:
+        return pickle.load(io.BytesIO(art_bytes))
+    except Exception:
+        pass
+
+    # Try JSON next
+    try:
+        j = json.loads(art_bytes.decode("utf-8"))
+        if isinstance(j, dict):
+            # Normalize to a trivial prior model; keep common defaults
+            return {
+                "clf": None,
+                "prior": float(j.get("prior", 0.5)),
+                "features": j.get("features", ["return", "rsi", "volatility"]),
+                "raw": j,
+            }
+    except Exception:
+        pass
+
+    # Last resort: return a safe neutral prior so the strategy can still run
+    return {"clf": None, "prior": 0.5, "features": ["return", "rsi", "volatility"]}
+
 def maybe_load_model(strategy_name: str) -> Optional[object]:
     """
     Load models/<strategy>/production/artifact.bin **only during MODEL_RELOAD_WINDOW_ET**,
-    at most once per ET day.  Returns the un-pickled object or None.
+    at most once per ET day. Returns the deserialized object or None.
     """
     window = os.getenv("MODEL_RELOAD_WINDOW_ET", "08:00-09:25")
     if not _in_window(window):
@@ -62,16 +92,16 @@ def maybe_load_model(strategy_name: str) -> Optional[object]:
     # try loading from registry
     try:
         art, meta, vtag = _registry.load_production(strategy_name)
-        model = pickle.load(io.BytesIO(art))
+        model_obj = _deserialize_artifact(art)
         _model_caches[strategy_name] = ModelCache(
-            obj=model, loaded_day=today, vtag=vtag, meta=meta
+            obj=model_obj, loaded_day=today, vtag=vtag, meta=meta
         )
+        metric = meta.get("metric")
         print(
-            f"[MODEL:{strategy_name}] loaded from S3 "
-            f"metric={meta.get('metric')} vtag={vtag[:8]}…",
+            f"[MODEL:{strategy_name}] loaded from S3 metric={metric} vtag={vtag[:8]}…",
             flush=True,
         )
-        return model
+        return model_obj
     except FileNotFoundError as e:
         print(f"[MODEL:{strategy_name}] no production artifact in S3 → {e}", flush=True)
         return None
@@ -129,17 +159,16 @@ def latest_features(bars: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optiona
 
 def proba_up_for(model_obj: object, x_live: pd.DataFrame) -> Optional[float]:
     """
-    Works with trainer’s artifact: either {"clf": RF, "features":[...]}
-    or trivial {"clf": None, "prior": 0.5}.
+    Works with:
+      - {"clf": sklearn_model, "features":[...]}
+      - {"clf": None, "prior": 0.5}  (JSON/placeholder artifacts)
     """
     if model_obj is None:
         return None
     try:
         clf = model_obj.get("clf")
         if clf is None:
-            # trivial prior model
             return float(model_obj.get("prior", 0.5))
-        # align features if provided
         feats = model_obj.get("features", ["return", "rsi", "volatility"])
         x = x_live
         try:
